@@ -108,7 +108,7 @@ Resources:
     Type: AWS::CodeBuild::Project
     Properties:
       Name: !Sub '${ProjectNamePrefix}-windows-build'
-      Description: Build Windows binaries for Claude Code with Nuitka
+      Description: !Sub 'Build Windows binaries for Claude Code with Nuitka - Updated ${AWS::StackName}'
       ServiceRole: !GetAtt CodeBuildServiceRole.Arn
       Artifacts:
         Type: S3
@@ -133,6 +133,11 @@ Resources:
                 - echo Starting Windows build environment setup...
                 - echo Installing Python 3.12...
                 - choco install python312 -y --no-progress
+                - echo Installing MinGW compiler...
+                - choco install mingw -y --no-progress
+                - echo Adding MinGW to PATH...
+                - $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
+                - if (Test-Path $mingwPath) { $env:PATH = "$mingwPath;$env:PATH" }
                 - echo Checking Python version...
                 - C:\Python312\python.exe --version
                 - echo Checking pip version...
@@ -152,9 +157,9 @@ Resources:
               commands:
                 - echo Building Windows executables sequentially...
                 - echo Building credential-process Windows executable...
-                - C:\Python312\python.exe -m nuitka --standalone --onefile --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code Credential Process" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="AWS Credential Process for Claude Code" --include-package=keyring.backends --output-filename=credential-process-windows.exe --output-dir=. --remove-output source/credential_provider/__main__.py
+                - C:\Python312\python.exe -m nuitka --standalone --onefile --assume-yes-for-downloads --mingw64 --company-name="Claude Code" --product-name="Claude Code Credential Process" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="AWS Credential Process for Claude Code" --include-package=keyring.backends --output-filename=credential-process-windows.exe --output-dir=. --remove-output source/credential_provider/__main__.py
                 - echo Building otel-helper Windows executable...
-                - C:\Python312\python.exe -m nuitka --standalone --onefile --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code OTEL Helper" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="OpenTelemetry Helper for Claude Code" --output-filename=otel-helper-windows.exe --output-dir=. --remove-output source/otel_helper/__main__.py
+                - C:\Python312\python.exe -m nuitka --standalone --onefile --assume-yes-for-downloads --mingw64 --company-name="Claude Code" --product-name="Claude Code OTEL Helper" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="OpenTelemetry Helper for Claude Code" --output-filename=otel-helper-windows.exe --output-dir=. --remove-output source/otel_helper/__main__.py
             post_build:
               commands:
                 - echo Build completed successfully
