@@ -271,6 +271,7 @@ Resources:
                                           'token_usage': float(message.get('claude_code.token.usage', 0)),
                                           'terminal_type': message.get('terminal.type', ''),
                                           'organization_id': message.get('organization.id', ''),
+                                          'cost_center': message.get('cost_center', ''),
                                           'otel_lib': message.get('OTelLib', ''),
                                           'user_email': message.get('user.email', ''),
                                           'user_account_uuid': message.get('user.account_uuid', '')
@@ -319,6 +320,7 @@ Resources:
                                           'token_usage': float(message.get('claude_code.token.usage', 0)),
                                           'terminal_type': message.get('terminal.type', ''),
                                           'organization_id': message.get('organization.id', ''),
+                                          'cost_center': message.get('cost_center', ''),
                                           'otel_lib': message.get('OTelLib', ''),
                                           'user_email': message.get('user.email', ''),
                                           'user_account_uuid': message.get('user.account_uuid', '')
