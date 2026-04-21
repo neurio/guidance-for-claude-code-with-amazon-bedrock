@@ -323,7 +323,7 @@ This ensures that packaging always works, even if some optional platforms are no
 - `install.bat` - Windows installer script
 - `README.md` - Installation instructions
 - Includes Claude Code telemetry settings (if monitoring enabled)
-- Configures environment variables for model selection (ANTHROPIC_MODEL, ANTHROPIC_SMALL_FAST_MODEL)
+- Configures environment variables for model selection (ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_HAIKU_MODEL)
 
 **Output structure:**
 

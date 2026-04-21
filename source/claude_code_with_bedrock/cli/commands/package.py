@@ -2339,10 +2339,10 @@ Available metrics include:
                     # For Opus, use Haiku as small/fast model
                     model_id = profile.selected_model
                     prefix = model_id.split(".anthropic")[0]  # Get us/eu/apac prefix
-                    settings["env"]["ANTHROPIC_SMALL_FAST_MODEL"] = f"{prefix}.anthropic.claude-3-5-haiku-20241022-v1:0"
+                    settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = f"{prefix}.anthropic.claude-haiku-4-5-20251001-v1:0"
                 else:
                     # For other models, use same model as small/fast (or could use Haiku)
-                    settings["env"]["ANTHROPIC_SMALL_FAST_MODEL"] = profile.selected_model
+                    settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = profile.selected_model
 
             # If monitoring is enabled, add telemetry configuration
             if profile.monitoring_enabled:
