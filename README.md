@@ -17,7 +17,7 @@ This guidance provides enterprise deployment patterns for Claude Code with Amazo
 ### For End Users
 
 - **Seamless Authentication**: Log in with corporate credentials
-- **Automatic Credential Refresh**: No manual token management required
+- **Automatic Credential Refresh**: No manual token management required (Azure AD supports silent refresh to eliminate browser re-authentication)
 - **AWS CLI/SDK Integration**: Works with any AWS tool or SDK
 - **Multi-Profile Support**: Manage multiple authentication profiles
 - **Cross-Platform**: Works on Windows, macOS, and Linux

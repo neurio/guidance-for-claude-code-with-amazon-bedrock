@@ -99,6 +99,25 @@ time aws sts get-caller-identity --profile ClaudeCode
 
 The first call takes 3-10 seconds including authentication. Cached calls complete in under a second. Credentials remain valid for up to 8 hours.
 
+### Testing Silent Refresh (Azure AD only)
+
+If `"enable_silent_refresh": true` is set in the profile config, you can verify that silent refresh works by clearing only the AWS credentials (not the refresh token) and triggering a new credential request:
+
+```bash
+# Clear cached AWS credentials and refresh token
+~/claude-code-with-bedrock/credential-process --clear-cache
+
+# First call - opens browser, stores refresh token
+aws sts get-caller-identity --profile ClaudeCode
+
+# Wait for AWS credentials to expire, or clear just the credentials cache
+# Next call should silently refresh without opening browser
+# Enable debug mode to see the silent refresh attempt:
+COGNITO_AUTH_DEBUG=1 aws sts get-caller-identity --profile ClaudeCode
+```
+
+Look for `"Attempting silent token refresh..."` and `"Silent refresh succeeded"` in the debug output.
+
 ## Validating Bedrock Access
 
 With authentication working, verify that users can access Amazon Bedrock models as intended. Start by listing available Claude models:

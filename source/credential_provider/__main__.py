@@ -481,6 +481,14 @@ class MultiProviderAuth:
         except Exception as e:
             self._debug_print(f"Could not clear keyring monitoring token: {e}")
 
+        # Clear refresh token from keyring
+        try:
+            if keyring.get_password("claude-code-with-bedrock", f"{self.profile}-refresh-token"):
+                keyring.set_password("claude-code-with-bedrock", f"{self.profile}-refresh-token", "")
+                cleared_items.append("keyring refresh token")
+        except Exception as e:
+            self._debug_print(f"Could not clear keyring refresh token: {e}")
+
         # Clear credentials file (for session storage mode)
         try:
             credentials_path = Path.home() / ".aws" / "credentials"
@@ -499,14 +507,18 @@ class MultiProviderAuth:
         except Exception as e:
             self._debug_print(f"Could not clear credentials file: {e}")
 
-        # Clear monitoring token from session directory
+        # Clear monitoring token and refresh token from session directory
         session_dir = Path.home() / ".claude-code-session"
         if session_dir.exists():
             monitoring_file = session_dir / f"{self.profile}-monitoring.json"
-
             if monitoring_file.exists():
                 monitoring_file.unlink()
                 cleared_items.append("monitoring token file")
+
+            refresh_token_file = session_dir / f"{self.profile}-refresh-token.json"
+            if refresh_token_file.exists():
+                refresh_token_file.unlink()
+                cleared_items.append("refresh token file")
 
             # Remove directory if empty
             try:
@@ -517,8 +529,26 @@ class MultiProviderAuth:
 
         return cleared_items
 
-    def save_monitoring_token(self, id_token, token_claims):
+    def save_refresh_token(self, refresh_token: str) -> None:
+        """Save OIDC refresh token to configured storage."""
+        try:
+            if self.credential_storage == "keyring":
+                keyring.set_password("claude-code-with-bedrock", f"{self.profile}-refresh-token", refresh_token)
+            else:
+                session_dir = Path.home() / ".claude-code-session"
+                session_dir.mkdir(parents=True, exist_ok=True)
+                token_file = session_dir / f"{self.profile}-refresh-token.json"
+                with open(token_file, "w") as f:
+                    json.dump({"refresh_token": refresh_token}, f)
+                token_file.chmod(0o600)
+            self._debug_print("Saved refresh token")
+        except Exception as e:
+            self._debug_print(f"Warning: Could not save refresh token: {e}")
+
+    def save_monitoring_token(self, id_token, token_claims, refresh_token=None):
         """Save ID token for monitoring authentication"""
+        if refresh_token:
+            self.save_refresh_token(refresh_token)
         try:
             # Extract relevant claims
             token_data = {
@@ -592,6 +622,22 @@ class MultiProviderAuth:
                 return token
 
             return None
+        except Exception:
+            return None
+
+    def get_stored_refresh_token(self) -> str | None:
+        """Retrieve the stored OIDC refresh token for the current profile, or None."""
+        try:
+            if self.credential_storage == "keyring":
+                return keyring.get_password("claude-code-with-bedrock", f"{self.profile}-refresh-token")
+            else:
+                session_dir = Path.home() / ".claude-code-session"
+                token_file = session_dir / f"{self.profile}-refresh-token.json"
+                if not token_file.exists():
+                    return None
+                with open(token_file) as f:
+                    data = json.load(f)
+                return data.get("refresh_token")
         except Exception:
             return None
 
@@ -742,6 +788,12 @@ class MultiProviderAuth:
 
     def authenticate_oidc(self):
         """Perform OIDC authentication with PKCE"""
+        # Add offline_access scope for Azure when silent refresh is enabled
+        scopes = self.provider_config["scopes"]
+        if self.provider_type == "azure" and self.config.get("enable_silent_refresh"):
+            if "offline_access" not in scopes:
+                scopes = scopes + " offline_access"
+
         state = secrets.token_urlsafe(16)
         nonce = secrets.token_urlsafe(16)
 
@@ -779,7 +831,7 @@ class MultiProviderAuth:
         auth_params = {
             "client_id": self.config["client_id"],
             "response_type": self.provider_config["response_type"],
-            "scope": self.provider_config["scopes"],
+            "scope": scopes,
             "redirect_uri": self.redirect_uri,
             "state": state,
             "nonce": nonce,
@@ -867,7 +919,8 @@ class MultiProviderAuth:
                 if claim in id_token_claims:
                     self._debug_print(f"{claim}: {id_token_claims[claim]}")
 
-        return tokens["id_token"], id_token_claims
+        refresh_token = tokens.get("refresh_token")
+        return tokens["id_token"], id_token_claims, refresh_token
 
     def _create_callback_handler(self, expected_state, result_container):
         """Create HTTP handler for OAuth callback"""
@@ -1207,6 +1260,63 @@ class MultiProviderAuth:
 
         return None
 
+    def try_silent_refresh(self) -> dict | None:
+        """Attempt to silently refresh AWS credentials using a stored OIDC refresh token.
+
+        Only supported for Azure AD with enable_silent_refresh config.
+        Returns formatted AWS credentials on success, or None on any failure.
+        """
+        try:
+            if self.provider_type != "azure" or not self.config.get("enable_silent_refresh"):
+                return None
+
+            refresh_token = self.get_stored_refresh_token()
+            if not refresh_token:
+                self._debug_print("No stored refresh token, skipping silent refresh")
+                return None
+
+            provider_domain = self.config["provider_domain"]
+            if provider_domain.endswith("/v2.0"):
+                provider_domain = provider_domain[:-5]
+            base_url = f"https://{provider_domain}"
+            token_url = f"{base_url}{self.provider_config['token_endpoint']}"
+
+            self._debug_print("Attempting silent token refresh...")
+            response = requests.post(
+                token_url,
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": self.config["client_id"],
+                    "refresh_token": refresh_token,
+                    "scope": self.provider_config["scopes"] + " offline_access",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30,
+            )
+
+            if not response.ok:
+                self._debug_print(f"Silent refresh failed (HTTP {response.status_code}): {response.text[:200]}")
+                return None
+
+            tokens = response.json()
+            new_id_token = tokens.get("id_token")
+            if not new_id_token:
+                self._debug_print("Silent refresh response missing id_token")
+                return None
+
+            new_claims = jwt.decode(new_id_token, options={"verify_signature": False})
+            new_refresh_token = tokens.get("refresh_token") or refresh_token
+            self.save_monitoring_token(new_id_token, new_claims, new_refresh_token)
+
+            self._debug_print("Silent refresh succeeded, exchanging for AWS credentials...")
+            credentials = self.get_aws_credentials(new_id_token, new_claims)
+            self.save_credentials(credentials)
+            return credentials
+
+        except Exception as e:
+            self._debug_print(f"Silent refresh failed unexpectedly: {e}")
+            return None
+
     def authenticate_for_monitoring(self):
         """Authenticate specifically for monitoring token (no AWS credential output)"""
         try:
@@ -1236,9 +1346,17 @@ class MultiProviderAuth:
                     test_socket.close()
                     raise
 
+            # Try silent refresh before triggering full browser authentication
+            silent_creds = self.try_silent_refresh()
+            if silent_creds:
+                monitoring_token = self.get_monitoring_token()
+                if monitoring_token:
+                    self._debug_print("Silent refresh succeeded for monitoring token")
+                    return monitoring_token
+
             # Authenticate with OIDC provider
             self._debug_print(f"Authenticating with {self.provider_config['name']} for monitoring token...")
-            id_token, token_claims = self.authenticate_oidc()
+            id_token, token_claims, refresh_token = self.authenticate_oidc()
 
             # Get AWS credentials (we need them but won't output them)
             self._debug_print("Exchanging token for AWS credentials...")
@@ -1248,7 +1366,7 @@ class MultiProviderAuth:
             self.save_credentials(credentials)
 
             # Save monitoring token
-            self.save_monitoring_token(id_token, token_claims)
+            self.save_monitoring_token(id_token, token_claims, refresh_token)
 
             # Return just the monitoring token
             return id_token
@@ -1817,9 +1935,16 @@ class MultiProviderAuth:
                 print(json.dumps(cached))  # noqa: S105
                 return 0
 
+            # Try silent refresh before falling back to browser
+            silent_creds = self.try_silent_refresh()
+            if silent_creds:
+                self._debug_print("Silent refresh succeeded, skipping browser flow")
+                print(json.dumps(silent_creds))  # noqa: S105
+                return 0
+
             # Authenticate with OIDC provider
             self._debug_print(f"Authenticating with {self.provider_config['name']} for profile '{self.profile}'...")
-            id_token, token_claims = self.authenticate_oidc()
+            id_token, token_claims, refresh_token = self.authenticate_oidc()
 
             # Check quota before issuing credentials (if configured)
             if self._should_check_quota():
@@ -1840,7 +1965,7 @@ class MultiProviderAuth:
             self.save_credentials(credentials)
 
             # Save monitoring token (non-blocking, failures don't affect AWS auth)
-            self.save_monitoring_token(id_token, token_claims)
+            self.save_monitoring_token(id_token, token_claims, refresh_token)
 
             # Output credentials
             # CodeQL: This is not a security issue - this is an AWS credential provider
