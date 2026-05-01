@@ -76,6 +76,10 @@ The authentication method is selected during initial configuration and both meth
 
 The temporary credentials are returned to Claude Code through the standard AWS CLI credential process protocol. The entire flow operates without any client secrets or long-lived credentials, following zero-trust security principles. Credentials are cached securely using either the operating system's keyring service or encrypted session files, preventing repeated authentication requests during the session lifetime.
 
+**Silent Refresh (Azure AD only)**
+
+When `enable_silent_refresh` is set to `true` in the profile configuration, the credential process requests an OIDC refresh token during the initial browser login by adding the `offline_access` scope. When AWS credentials expire, the credential process attempts to silently exchange the stored refresh token for a new ID token without opening a browser. If the silent refresh fails (e.g., the refresh token was revoked or expired), the system falls back to the normal browser-based authentication flow. This eliminates re-login prompts during a normal workday for Azure AD users.
+
 ## AWS CLI Credential Process Protocol
 
 The solution leverages the [AWS CLI external credential process](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sourcing-external.html), a feature that allows custom credential providers to integrate with AWS CLI. When the AWS CLI needs credentials for a profile configured with `credential_process`, it executes the specified program and expects JSON-formatted temporary credentials on stdout.

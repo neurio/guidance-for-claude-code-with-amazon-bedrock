@@ -291,6 +291,24 @@ Force re-authentication:
 ~/claude-code-with-bedrock/credential-process --clear-cache
 ```
 
+### Frequent Re-authentication (Azure AD)
+
+If you are prompted to re-authenticate in the browser every time your AWS credentials expire, you can enable silent refresh. This uses an OIDC refresh token to obtain new credentials without opening a browser.
+
+**Prerequisites**: The Azure AD app registration must have the `offline_access` API permission granted (see [Microsoft Entra ID Setup](assets/docs/providers/microsoft-entra-id-setup.md)).
+
+Add `"enable_silent_refresh": true` to your profile in `~/claude-code-with-bedrock/config.json`:
+
+```json
+{
+  "ClaudeCode": {
+    ...
+    "provider_type": "azure",
+    "enable_silent_refresh": true
+  }
+}
+```
+
 ### Build Failures
 
 Check Windows build status:

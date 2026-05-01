@@ -86,9 +86,37 @@ After registration, save these values:
 2. Toggle **Allow public client flows** to **Yes**
 3. Click **Save**
 
-### Step 4.3: Verify API Permissions
+### Step 4.3: Add API Permissions for Silent Refresh (Optional)
 
-The default `User.Read` permission is sufficient. No changes needed.
+If you plan to enable silent credential refresh (to avoid browser re-authentication when AWS credentials expire), you must grant the `offline_access` permission:
+
+1. Click **API permissions** in your app registration
+2. Click **+ Add a permission**
+3. Select **Microsoft Graph** → **Delegated permissions**
+4. Search for and check **offline_access**
+5. Click **Add permissions**
+
+Then add `"enable_silent_refresh": true` to the user's `config.json` profile:
+
+```json
+{
+  "ClaudeCode": {
+    "provider_domain": "login.microsoftonline.com/{tenant-id}/v2.0",
+    "client_id": "your-client-id",
+    "identity_pool_id": "us-east-1:your-pool-id",
+    "aws_region": "us-east-1",
+    "provider_type": "azure",
+    "credential_storage": "keyring",
+    "enable_silent_refresh": true
+  }
+}
+```
+
+Without this permission and config flag, users will be prompted to re-authenticate in the browser each time their AWS credentials expire.
+
+### Step 4.4: Verify Default API Permissions
+
+The default `User.Read` permission is sufficient for basic authentication. No additional changes needed beyond the optional `offline_access` above.
 
 ---
 
