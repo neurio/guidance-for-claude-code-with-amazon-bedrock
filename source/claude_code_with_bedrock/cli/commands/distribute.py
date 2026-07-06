@@ -24,6 +24,41 @@ from claude_code_with_bedrock.cli.utils.aws import get_stack_outputs
 from claude_code_with_bedrock.config import Config
 
 
+def _copy_artifact(source: Path, dest: Path) -> None:
+    """Copy a build artifact into a package staging directory.
+
+    Build artifacts used to be single files (PyInstaller ``--onefile``,
+    Nuitka ``--onefile``). After the MEI-leak fix they are directories
+    (PyInstaller ``--onedir``, Nuitka ``--standalone``). This helper
+    handles both shapes: directories are copied recursively, files are
+    copied preserving metadata.
+    """
+    if source.is_dir():
+        shutil.copytree(source, dest)
+    else:
+        shutil.copy2(source, dest)
+
+
+def _add_to_zip(zipf, source: Path, archive_root: str) -> None:
+    """Add a build artifact (file or directory) to a ``zipfile.ZipFile``.
+
+    ``archive_root`` is the destination path inside the archive. For a
+    single file this is the full archive path of the file. For a
+    directory, this is the root under which the tree is placed; each
+    file inside the directory is added at
+    ``archive_root/<relative-path-inside-source>``.
+
+    Handles both shapes for the same reason as ``_copy_artifact``.
+    """
+    if source.is_dir():
+        for entry in source.rglob("*"):
+            if entry.is_file():
+                rel = entry.relative_to(source)
+                zipf.write(entry, f"{archive_root}/{rel}")
+    else:
+        zipf.write(source, archive_root)
+
+
 class S3UploadProgress:
     """Track S3 upload progress."""
 
@@ -600,7 +635,7 @@ class DistributeCommand(Command):
                     for source_file, archive_name in files:
                         source_path = package_path / source_file
                         if source_path.exists():
-                            zipf.write(source_path, f"claude-code-package/{archive_name}")
+                            _add_to_zip(zipf, source_path, f"claude-code-package/{archive_name}")
 
                     # Include claude-settings if it exists
                     settings_dir = package_path / "claude-settings"
@@ -1123,11 +1158,14 @@ class DistributeCommand(Command):
         if settings_dir.exists() and settings_dir.is_dir():
             shutil.copytree(settings_dir, package_temp_dir / "claude-settings")
 
-        # Copy only the required files
+        # Copy only the required files. Executable artifacts are now
+        # directories (see the MEI-leak fix); other required files
+        # (install.sh, config.json, README.md) are still single files.
+        # ``_copy_artifact`` handles both.
         for filename in required_files:
             source_file = package_path / filename
             if source_file.exists():
-                shutil.copy2(source_file, package_temp_dir / filename)
+                _copy_artifact(source_file, package_temp_dir / filename)
 
         # Create zip archive with contents at root level
         # When extracted, it will create claude-code-package/ with files directly inside
