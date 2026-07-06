@@ -159,14 +159,28 @@ poetry run ccwb distribute
 
 The `dist/` folder will contain:
 
-- `credential-process-macos-arm64` - Authentication executable for macOS ARM64
-- `credential-process-macos-intel` - Authentication executable for macOS Intel (if built)
-- `credential-process-windows.exe` - Authentication executable for Windows
-- `credential-process-linux` - Authentication executable for Linux (if built on Linux)
-- `config.json` - Embedded configuration
-- `install.sh` - Installation script for Unix systems
-- `install.bat` - Installation script for Windows
-- `README.md` - User instructions
+- `credential-process-macos-arm64/` — Authentication executable directory for macOS ARM64. Contains the launcher plus its `_internal/` deps.
+- `credential-process-macos-intel/` — Authentication executable directory for macOS Intel (if built).
+- `credential-process-windows/` — Authentication executable directory for Windows (Nuitka-standalone output). Ships alongside `credential-process.exe`, a small forwarding stub that keeps existing `~/.aws/config` entries working after upgrade.
+- `credential-process-linux-x64/` (or `credential-process-linux-arm64/`) — Authentication executable directory for Linux.
+- `config.json` — Embedded configuration.
+- `install.sh` — Installation script for Unix systems.
+- `install.bat` — Installation script for Windows.
+- `README.md` — User instructions.
+
+> **Directory-shaped executables:** Each `credential-process-*` and
+> `otel-helper-*` artifact is a directory tree rather than a single
+> file. This is deliberate: the previous single-file distribution
+> used PyInstaller / Nuitka `--onefile`, which extracted a bundled
+> archive to a per-invocation temp directory at startup. Under
+> abnormal termination (SIGKILL, hard timeouts from boto3, OOM),
+> the cleanup path did not run and the temp directories
+> accumulated. Directory-shaped executables run directly from
+> their install location and never extract anything at runtime.
+> `install.sh` and `install.bat` move the directory into place and
+> expose the historical invocation path (a symlink on Unix, a
+> real `.exe` forwarding stub on Windows) so no user config
+> changes are required on upgrade.
 - `.claude/settings.json` - Claude Code telemetry settings (if monitoring enabled)
 - `otel-helper-*` - OTEL helper executables for each platform (if monitoring enabled)
 
