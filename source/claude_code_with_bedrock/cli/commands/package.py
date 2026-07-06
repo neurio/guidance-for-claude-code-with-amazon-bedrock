@@ -646,10 +646,18 @@ class PackageCommand(Command):
                 "nuitka",
             ]
 
-        # Add common Nuitka flags
+        # Add common Nuitka flags.
+        #
+        # NOTE: `--standalone` without `--onefile` is intentional. `--onefile`
+        # bundles everything into a single executable that extracts to a
+        # per-invocation temp directory (Windows: `%TEMP%\onefile_*`) at
+        # startup and cleans up via atexit. Abnormal termination bypasses
+        # that cleanup, so under credential_process workloads that get
+        # killed by boto3 timeouts the extraction directories accumulate.
+        # `--standalone` alone produces a directory tree (`{name}.dist/`)
+        # that runs directly from its install location with no extraction.
         nuitka_flags = [
             "--standalone",
-            "--onefile",
             "--assume-yes-for-downloads",
             f"--output-filename={binary_name}",
             f"--output-dir={str(output_dir)}",
@@ -678,12 +686,6 @@ class PackageCommand(Command):
                     "--disable-console",  # GUI app on macOS
                 ]
             )
-        elif target_platform == "linux":
-            cmd.extend(
-                [
-                    "--linux-onefile-icon=NONE",  # No icon for Linux
-                ]
-            )
 
         # Add the source file
         cmd.append(str(src_file))
@@ -694,7 +696,9 @@ class PackageCommand(Command):
         if result.returncode != 0:
             raise RuntimeError(f"Nuitka build failed: {result.stderr}")
 
-        return output_dir / binary_name
+        # `--standalone` output layout: `{output-dir}/{name}.dist/{name}`
+        # (launcher) plus dependencies alongside it.
+        return output_dir / f"{binary_name}.dist" / binary_name
 
     def _build_macos_pyinstaller(self, output_dir: Path, arch: str) -> Path:
         """Build macOS executable using PyInstaller with target architecture."""
@@ -740,14 +744,21 @@ class PackageCommand(Command):
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command.
+        #
+        # NOTE: `--onedir` is intentional. `--onefile` extracts to a
+        # per-invocation temp directory (macOS: `$TMPDIR/_MEI*`) at
+        # startup and cleans up via atexit. Abnormal termination bypasses
+        # that cleanup, so under credential_process workloads that get
+        # killed by boto3 timeouts the extraction directories accumulate.
+        # `--onedir` avoids the extraction entirely.
         if use_x86_python:
             # Use x86_64 Python environment
             cmd = [
                 "arch",
                 "-x86_64",
                 str(x86_venv_path / "bin" / "pyinstaller"),
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -768,7 +779,7 @@ class PackageCommand(Command):
                 "poetry",
                 "run",
                 "pyinstaller",
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--target-arch={arch}",
@@ -793,7 +804,8 @@ class PackageCommand(Command):
             console.print(f"[red]PyInstaller build failed: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
+        # `--onedir` output layout: `{distpath}/{name}/{name}` (launcher).
+        binary_path = output_dir / binary_name / binary_name
         if binary_path.exists():
             binary_path.chmod(0o755)
             console.print(f"[green]✓ macOS {arch} binary built successfully with PyInstaller[/green]")
@@ -825,12 +837,21 @@ class PackageCommand(Command):
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command.
+        #
+        # NOTE: `--onedir` is intentional. `--onefile` extracts the bundled
+        # archive to a per-invocation temp directory (`/tmp/_MEI*`) at startup
+        # and cleans it up via an atexit hook. Abnormal termination (SIGKILL,
+        # OOM, hard timeout) bypasses that hook and leaves the directory
+        # behind, so under credential_process workloads that get killed by
+        # boto3 timeouts the extraction directories accumulate and can fill
+        # `/tmp`. `--onedir` avoids the extraction entirely: the launcher
+        # runs directly from its install location.
         cmd = [
             "poetry",
             "run",
             "pyinstaller",
-            "--onefile",
+            "--onedir",
             "--clean",
             "--noconfirm",
             f"--name={binary_name}",
@@ -858,7 +879,10 @@ class PackageCommand(Command):
             console.print(f"[red]PyInstaller build failed: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
+        # `--onedir` output layout: `{distpath}/{name}/{name}` (launcher) plus
+        # `{distpath}/{name}/_internal/` (dependencies). Return the launcher
+        # path; the containing directory is the shipping unit.
+        binary_path = output_dir / binary_name / binary_name
         if binary_path.exists():
             binary_path.chmod(0o755)
             console.print("[green]✓ Linux binary built successfully with PyInstaller[/green]")
@@ -955,9 +979,14 @@ WORKDIR /build
 # Copy source code
 COPY credential_provider /build/credential_provider
 
-# Build the binary with PyInstaller
+# Build the binary with PyInstaller.
+#
+# NOTE: `--onedir` is intentional. `--onefile` extracts to `/tmp/_MEI*`
+# at startup and cleans up via atexit; abnormal termination bypasses
+# that cleanup and leaks the directory. `--onedir` runs directly
+# from the install location.
 RUN pyinstaller \
-    --onefile \
+    --onedir \
     --clean \
     --noconfirm \
     --name {binary_name} \
@@ -975,7 +1004,8 @@ RUN pyinstaller \
     --hidden-import dateutil \
     credential_provider/__main__.py
 
-# The binary will be in /output/{binary_name}
+# The binary tree will be in /output/{binary_name}/ with the launcher at
+# /output/{binary_name}/{binary_name}.
 """
 
             (temp_path / "Dockerfile").write_text(dockerfile_content)
@@ -1034,7 +1064,10 @@ RUN pyinstaller \
                 raise RuntimeError(f"Failed to create container: {run_result.stderr}")
 
             try:
-                # Copy binary from container
+                # Copy binary tree from container. `docker cp` handles
+                # directories transparently: copying `/output/{name}`
+                # yields `output_dir/{name}/` with the launcher at
+                # `output_dir/{name}/{name}`.
                 copy_result = subprocess.run(
                     ["docker", "cp", f"{container_name}:/output/{binary_name}", str(output_dir)],
                     capture_output=True,
@@ -1044,8 +1077,8 @@ RUN pyinstaller \
                 if copy_result.returncode != 0:
                     raise RuntimeError(f"Failed to copy binary from container: {copy_result.stderr}")
 
-                # Verify the binary was created
-                binary_path = output_dir / binary_name
+                # Verify the launcher exists inside the copied directory
+                binary_path = output_dir / binary_name / binary_name
                 if not binary_path.exists():
                     raise RuntimeError(f"Linux {arch} binary was not created successfully")
 
@@ -1138,9 +1171,13 @@ WORKDIR /build
 # Copy source code
 COPY otel_helper /build/otel_helper
 
-# Build the binary with PyInstaller
+# Build the binary with PyInstaller.
+#
+# NOTE: `--onedir` matches the credential-process build. See the
+# comment in the credential-process Dockerfile above for the leak
+# rationale.
 RUN pyinstaller \
-    --onefile \
+    --onedir \
     --clean \
     --noconfirm \
     --name {binary_name} \
@@ -1152,7 +1189,8 @@ RUN pyinstaller \
     --hidden-import six.moves \
     otel_helper/__main__.py
 
-# The binary will be in /output/{binary_name}
+# The binary tree will be in /output/{binary_name}/ with the launcher
+# at /output/{binary_name}/{binary_name}.
 """
 
             (temp_path / "Dockerfile").write_text(dockerfile_content)
@@ -1211,7 +1249,10 @@ RUN pyinstaller \
                 raise RuntimeError(f"Failed to create container: {run_result.stderr}")
 
             try:
-                # Copy binary from container
+                # Copy binary tree from container. `docker cp` handles
+                # directories transparently: copying `/output/{name}`
+                # yields `output_dir/{name}/` with the launcher at
+                # `output_dir/{name}/{name}`.
                 copy_result = subprocess.run(
                     ["docker", "cp", f"{container_name}:/output/{binary_name}", str(output_dir)],
                     capture_output=True,
@@ -1221,8 +1262,8 @@ RUN pyinstaller \
                 if copy_result.returncode != 0:
                     raise RuntimeError(f"Failed to copy OTEL binary from container: {copy_result.stderr}")
 
-                # Verify the binary was created
-                binary_path = output_dir / binary_name
+                # Verify the launcher exists inside the copied directory
+                binary_path = output_dir / binary_name / binary_name
                 if not binary_path.exists():
                     raise RuntimeError(f"Linux {arch} OTEL helper binary was not created successfully")
 
@@ -1503,14 +1544,17 @@ RUN pyinstaller \
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command.
+        #
+        # NOTE: `--onedir` matches the credential-process build. See the
+        # comment in _build_linux_pyinstaller for the leak rationale.
         if use_x86_python:
             # Use x86_64 Python environment
             cmd = [
                 "arch",
                 "-x86_64",
                 str(x86_venv_path / "bin" / "pyinstaller"),
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -1526,7 +1570,7 @@ RUN pyinstaller \
                 "poetry",
                 "run",
                 "pyinstaller",
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -1549,7 +1593,8 @@ RUN pyinstaller \
             console.print(f"[red]PyInstaller build failed for OTEL helper: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
+        # `--onedir` output layout: `{distpath}/{name}/{name}` (launcher).
+        binary_path = output_dir / binary_name / binary_name
         if binary_path.exists():
             binary_path.chmod(0o755)
             console.print("[green]✓ OTEL helper built successfully with PyInstaller[/green]")
@@ -1621,11 +1666,14 @@ RUN pyinstaller \
                 "nuitka",
             ]
 
-        # Add common Nuitka flags
+        # Add common Nuitka flags.
+        #
+        # NOTE: `--standalone` without `--onefile` matches the
+        # credential-process build. See the comment in
+        # _build_native_executable_nuitka for the leak rationale.
         cmd.extend(
             [
                 "--standalone",
-                "--onefile",
                 "--assume-yes-for-downloads",
                 f"--output-filename={binary_name}",
                 f"--output-dir={str(output_dir)}",
@@ -1644,12 +1692,6 @@ RUN pyinstaller \
                     "--disable-console",
                 ]
             )
-        elif target_platform == "linux":
-            cmd.extend(
-                [
-                    "--linux-onefile-icon=NONE",
-                ]
-            )
 
         # Add the source file
         cmd.append(str(src_file))
@@ -1660,7 +1702,8 @@ RUN pyinstaller \
         if result.returncode != 0:
             raise RuntimeError(f"Nuitka build failed for OTEL helper: {result.stderr}")
 
-        return output_dir / binary_name
+        # `--standalone` output layout: `{output-dir}/{name}.dist/{name}`.
+        return output_dir / f"{binary_name}.dist" / binary_name
 
     def _create_config(
         self,
