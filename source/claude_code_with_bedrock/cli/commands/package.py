@@ -1451,6 +1451,18 @@ RUN pyinstaller \
             if pyproject_file.exists():
                 zf.write(pyproject_file, "pyproject.toml")
 
+            # Add Windows forwarding-stub C source. This is compiled
+            # inside the CodeBuild Windows image via MinGW (already on
+            # PATH there) into `credential-process.exe` and
+            # `otel-helper.exe` sibling shims. See
+            # source/windows_stubs/credential_process_stub.c for the
+            # rationale.
+            windows_stubs_dir = source_dir / "windows_stubs"
+            if windows_stubs_dir.exists() and windows_stubs_dir.is_dir():
+                for c_file in windows_stubs_dir.rglob("*.c"):
+                    arcname = str(c_file.relative_to(source_dir.parent))
+                    zf.write(c_file, arcname)
+
         return source_zip
 
     def _build_otel_helper(self, output_dir: Path, target_platform: str) -> Path:
@@ -1857,11 +1869,18 @@ else
     exit 1
 fi
 
-# Check if binary for platform exists
+# Check if binary tree for platform exists.
+#
+# The build now ships each binary as a directory (see MEI-leak fix).
+# The install layout below places that directory at
+# `~/claude-code-with-bedrock/credential-process-dist/` and creates a
+# backward-compatible symlink at `~/claude-code-with-bedrock/credential-process`
+# so pre-existing `~/.aws/config` entries continue to work without
+# any user action.
 CREDENTIAL_BINARY="credential-process-$BINARY_SUFFIX"
 OTEL_BINARY="otel-helper-$BINARY_SUFFIX"
 
-if [ ! -f "$CREDENTIAL_BINARY" ]; then
+if [ ! -d "$CREDENTIAL_BINARY" ]; then
     echo "❌ Binary not found for your platform: $CREDENTIAL_BINARY"
     echo "   Please ensure you have the correct package for your architecture."
     exit 1
@@ -1869,17 +1888,31 @@ fi
 """
 
         installer_content += f"""
-# Create directory
+# Create install directory
 echo
 echo "Installing authentication tools..."
 mkdir -p ~/claude-code-with-bedrock
 
-# Copy appropriate binary
-cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
+# Install credential-process.
+#
+# The binary is shipped as a directory tree (see MEI-leak fix): a
+# launcher plus its `_internal/` deps. We move that tree into
+# `~/claude-code-with-bedrock/credential-process-dist/` and expose a
+# backward-compatible entry at `~/claude-code-with-bedrock/credential-process`
+# via a symlink so existing `~/.aws/config` entries pointing at
+# `~/claude-code-with-bedrock/credential-process` continue to work.
+#
+# Upgrade handling: if a pre-fix single-file `credential-process` is
+# present from an earlier install, remove it before creating the
+# symlink. Same for a stale dist directory from a previous upgrade.
+rm -rf ~/claude-code-with-bedrock/credential-process-dist
+rm -f ~/claude-code-with-bedrock/credential-process
+cp -R "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process-dist
+chmod +x "$HOME/claude-code-with-bedrock/credential-process-dist/$CREDENTIAL_BINARY"
+ln -s "credential-process-dist/$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
 
 # Copy config
 cp config.json ~/claude-code-with-bedrock/
-chmod +x ~/claude-code-with-bedrock/credential-process
 
 # macOS Keychain Notice
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -1923,21 +1956,31 @@ if [ -d "claude-settings" ]; then
     fi
 fi
 
-# Copy OTEL helper executable and shell wrapper if present
-if [ -f "$OTEL_BINARY" ]; then
+# Copy OTEL helper executable tree and shell wrapper if present.
+#
+# Same directory-artifact treatment as credential-process. Legacy
+# invocation paths remain valid via a symlink at otel-helper-bin.
+if [ -d "$OTEL_BINARY" ]; then
     echo
     echo "Installing OTEL helper..."
-    # Install PyInstaller binary as otel-helper-bin (fallback for cache miss)
-    cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper-bin
-    chmod +x ~/claude-code-with-bedrock/otel-helper-bin
-    # Install shell wrapper as otel-helper (fast cache check, avoids PyInstaller startup)
+    # Install the onedir binary tree at otel-helper-dist and expose the
+    # launcher at otel-helper-bin via a symlink (fallback for shell-
+    # wrapper cache miss).
+    rm -rf ~/claude-code-with-bedrock/otel-helper-dist
+    rm -f ~/claude-code-with-bedrock/otel-helper-bin
+    cp -R "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper-dist
+    chmod +x "$HOME/claude-code-with-bedrock/otel-helper-dist/$OTEL_BINARY"
+    ln -s "otel-helper-dist/$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper-bin
+    # Install shell wrapper as otel-helper (fast cache check, avoids
+    # PyInstaller startup on every invocation).
+    rm -f ~/claude-code-with-bedrock/otel-helper
     if [ -f "otel-helper.sh" ]; then
         cp "otel-helper.sh" ~/claude-code-with-bedrock/otel-helper
         chmod +x ~/claude-code-with-bedrock/otel-helper
     else
-        # Fallback: if shell wrapper not in package, point directly to binary
-        cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper
-        chmod +x ~/claude-code-with-bedrock/otel-helper
+        # Fallback: if shell wrapper not in package, point directly at
+        # the launcher via the same symlink target.
+        ln -s "otel-helper-dist/$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper
     fi
     echo "✓ OTEL helper installed"
 fi
@@ -2060,19 +2103,44 @@ REM Create directory
 echo Installing authentication tools...
 if not exist "%USERPROFILE%\\claude-code-with-bedrock" mkdir "%USERPROFILE%\\claude-code-with-bedrock"
 
-REM Copy credential process executable with renamed target
+REM Install credential-process.
+REM
+REM The binary is shipped as a directory tree (see MEI-leak fix): a
+REM launcher .exe plus its dependencies. Move that tree into
+REM %USERPROFILE%\claude-code-with-bedrock\credential-process-dist\
+REM and place a tiny forwarding stub at
+REM %USERPROFILE%\claude-code-with-bedrock\credential-process.exe
+REM which is a real PE executable that CreateProcesses the real
+REM launcher inside the dist directory. Existing ~/.aws/config
+REM entries pointing at credential-process.exe keep working with
+REM zero user action; boto3's shell=False Popen honours the .exe
+REM path directly.
+REM
+REM Upgrade handling: remove any stale dist directory before copying
+REM (the .exe stub itself is replaced by the copy /Y below).
 echo Copying credential process...
-copy /Y "credential-process-windows.exe" "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe" >nul
+if exist "%USERPROFILE%\\claude-code-with-bedrock\\credential-process-dist" rmdir /S /Q "%USERPROFILE%\\claude-code-with-bedrock\\credential-process-dist"
+xcopy /E /I /Y "credential-process-windows" "%USERPROFILE%\\claude-code-with-bedrock\\credential-process-dist" >nul
 if %errorlevel% neq 0 (
-    echo ERROR: Failed to copy credential-process-windows.exe
+    echo ERROR: Failed to copy credential-process-windows tree
+    pause
+    exit /b 1
+)
+copy /Y "credential-process.exe" "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe" >nul
+if %errorlevel% neq 0 (
+    echo ERROR: Failed to copy credential-process.exe forwarding stub
     pause
     exit /b 1
 )
 
-REM Copy OTEL helper if it exists with renamed target
-if exist "otel-helper-windows.exe" (
+REM Install OTEL helper if it exists (same directory-artifact + stub treatment).
+if exist "otel-helper-windows" (
     echo Copying OTEL helper...
-    copy /Y "otel-helper-windows.exe" "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper.exe" >nul
+    if exist "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper-dist" rmdir /S /Q "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper-dist"
+    xcopy /E /I /Y "otel-helper-windows" "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper-dist" >nul
+    if exist "otel-helper.exe" (
+        copy /Y "otel-helper.exe" "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper.exe" >nul
+    )
 )
 
 REM Copy configuration
@@ -2097,7 +2165,11 @@ if exist "claude-settings" (
         )
 
         if not "%SKIP_SETTINGS%"=="true" (
-            REM Use PowerShell to replace placeholders
+            REM Use PowerShell to replace placeholders. After the MEI-
+            REM leak fix the .exe at this path is a small forwarding
+            REM stub that CreateProcesses the real launcher inside the
+            REM sibling dist directory; the invocation path itself is
+            REM unchanged from the pre-fix install.
             powershell -Command ^
             "$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper.exe' ^
             -replace '\\\\\\\\', '/'; ^
@@ -2126,7 +2198,10 @@ for /f %%p in ('powershell -Command ^
     "& {{$c=Get-Content config.json|ConvertFrom-Json;$c.'%%p'.aws_region}}"') do set PROFILE_REGION=%%r
 
 
-    REM Set credential process with --profile flag (cross-platform, no wrapper needed)
+    REM Set credential process with --profile flag. The .exe at this
+    REM path is a forwarding stub (see MEI-leak fix); the invocation
+    REM path is unchanged from the pre-fix install so existing configs
+    REM keep working.
     aws configure set credential_process ^
     "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe --profile %%p" --profile %%p
 
