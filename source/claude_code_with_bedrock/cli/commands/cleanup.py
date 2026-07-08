@@ -170,10 +170,25 @@ class CleanupCommand(Command):
             )
         )
 
-        # Check if credential-process exists
-        credential_process = Path.home() / "claude-code-with-bedrock" / "credential-process"
+        # Locate the credential-process entry point. On Linux/macOS
+        # this is a symlink into `credential-process-dist/`; on Windows
+        # it's a forwarding .exe stub. See install.sh / install.bat.
+        # Fall back through the same candidates the pre-MEI-leak-fix
+        # install produced so this command works against legacy setups
+        # too.
+        install_root = Path.home() / "claude-code-with-bedrock"
+        credential_process = None
+        candidates = [
+            install_root / "credential-process",       # Unix symlink / legacy
+            install_root / "credential-process.exe",   # Windows stub / legacy
+            install_root / "credential-process.cmd",   # transitional install variant
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                credential_process = candidate
+                break
 
-        if not credential_process.exists():
+        if credential_process is None:
             console.print("[yellow]Credential process not found. Nothing to clear.[/yellow]")
             return 0
 

@@ -140,23 +140,63 @@ class TestCommand(Command):
             console.print(f"[red]Unsupported platform: {system}[/red]")
             return 1
 
-        # Check for platform binary
-        credential_binary = package_dir / f"credential-process-{platform_suffix}"
-        if system == "windows" and not credential_binary.exists():
+        # Locate the platform binary. After the MEI-leak fix, each
+        # binary is shipped as a directory tree containing a launcher
+        # plus its dependencies. On Linux/macOS the directory is named
+        # `credential-process-<suffix>` (e.g. `credential-process-linux-x64`)
+        # with the launcher at the same name inside; on Windows the
+        # buildspec renames Nuitka's `<name>.exe.dist` output to `<name>`
+        # for the same convention, and a real `.exe` forwarding stub is
+        # shipped alongside for direct invocation. Prefer the launcher
+        # inside the directory (bypasses the stub, exercises the actual
+        # binary directly for the test) but fall back to the top-level
+        # stub if the directory-form is not present (e.g. legacy pre-fix
+        # packages).
+        credential_dir = package_dir / f"credential-process-{platform_suffix}"
+        credential_launcher_name = (
+            f"credential-process-{platform_suffix}.exe"
+            if system == "windows"
+            else f"credential-process-{platform_suffix}"
+        )
+        if credential_dir.is_dir() and (credential_dir / credential_launcher_name).exists():
+            credential_binary = credential_dir / credential_launcher_name
+        elif system == "windows" and (package_dir / "credential-process.exe").exists():
+            credential_binary = package_dir / "credential-process.exe"
+        elif system == "windows" and (package_dir / f"credential-process-{platform_suffix}.exe").exists():
+            # Legacy: pre-fix onefile Windows build produced a single .exe
+            # here. Fall back to it so testing a pre-fix package still works.
             credential_binary = package_dir / f"credential-process-{platform_suffix}.exe"
-
-        if not credential_binary.exists():
-            console.print(f"[red]✗ Binary not found for your platform: {credential_binary.name}[/red]")
+        elif (package_dir / f"credential-process-{platform_suffix}").is_file():
+            # Legacy: pre-fix onefile Linux/macOS build.
+            credential_binary = package_dir / f"credential-process-{platform_suffix}"
+        else:
+            console.print(
+                f"[red]✗ Binary not found for your platform: credential-process-{platform_suffix}[/red]"
+            )
             return 1
 
-        console.print(f"✓ Found binary: {credential_binary.name}")
+        console.print(f"✓ Found binary: {credential_binary.relative_to(package_dir)}")
 
-        # Check for OTEL helper (optional)
-        otel_binary = package_dir / f"otel-helper-{platform_suffix}"
-        if system == "windows" and not otel_binary.exists():
+        # Check for OTEL helper (optional). Same directory-first, legacy-
+        # fallback pattern as credential-process above.
+        otel_dir = package_dir / f"otel-helper-{platform_suffix}"
+        otel_launcher_name = (
+            f"otel-helper-{platform_suffix}.exe"
+            if system == "windows"
+            else f"otel-helper-{platform_suffix}"
+        )
+        if otel_dir.is_dir() and (otel_dir / otel_launcher_name).exists():
+            otel_binary = otel_dir / otel_launcher_name
+        elif system == "windows" and (package_dir / "otel-helper.exe").exists():
+            otel_binary = package_dir / "otel-helper.exe"
+        elif system == "windows" and (package_dir / f"otel-helper-{platform_suffix}.exe").exists():
             otel_binary = package_dir / f"otel-helper-{platform_suffix}.exe"
+        elif (package_dir / f"otel-helper-{platform_suffix}").is_file():
+            otel_binary = package_dir / f"otel-helper-{platform_suffix}"
+        else:
+            otel_binary = otel_dir  # sentinel path for has_otel below
 
-        has_otel = otel_binary.exists()
+        has_otel = otel_binary.is_file()
         if has_otel:
             console.print(f"✓ Found OTEL helper: {otel_binary.name}")
         else:

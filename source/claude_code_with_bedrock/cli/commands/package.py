@@ -646,10 +646,18 @@ class PackageCommand(Command):
                 "nuitka",
             ]
 
-        # Add common Nuitka flags
+        # Add common Nuitka flags.
+        #
+        # NOTE: `--standalone` without `--onefile` is intentional. `--onefile`
+        # bundles everything into a single executable that extracts to a
+        # per-invocation temp directory (Windows: `%TEMP%\onefile_*`) at
+        # startup and cleans up via atexit. Abnormal termination bypasses
+        # that cleanup, so under credential_process workloads that get
+        # killed by boto3 timeouts the extraction directories accumulate.
+        # `--standalone` alone produces a directory tree (`{name}.dist/`)
+        # that runs directly from its install location with no extraction.
         nuitka_flags = [
             "--standalone",
-            "--onefile",
             "--assume-yes-for-downloads",
             f"--output-filename={binary_name}",
             f"--output-dir={str(output_dir)}",
@@ -678,12 +686,6 @@ class PackageCommand(Command):
                     "--disable-console",  # GUI app on macOS
                 ]
             )
-        elif target_platform == "linux":
-            cmd.extend(
-                [
-                    "--linux-onefile-icon=NONE",  # No icon for Linux
-                ]
-            )
 
         # Add the source file
         cmd.append(str(src_file))
@@ -694,7 +696,9 @@ class PackageCommand(Command):
         if result.returncode != 0:
             raise RuntimeError(f"Nuitka build failed: {result.stderr}")
 
-        return output_dir / binary_name
+        # `--standalone` output layout: `{output-dir}/{name}.dist/{name}`
+        # (launcher) plus dependencies alongside it.
+        return output_dir / f"{binary_name}.dist" / binary_name
 
     def _build_macos_pyinstaller(self, output_dir: Path, arch: str) -> Path:
         """Build macOS executable using PyInstaller with target architecture."""
@@ -740,14 +744,21 @@ class PackageCommand(Command):
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command.
+        #
+        # NOTE: `--onedir` is intentional. `--onefile` extracts to a
+        # per-invocation temp directory (macOS: `$TMPDIR/_MEI*`) at
+        # startup and cleans up via atexit. Abnormal termination bypasses
+        # that cleanup, so under credential_process workloads that get
+        # killed by boto3 timeouts the extraction directories accumulate.
+        # `--onedir` avoids the extraction entirely.
         if use_x86_python:
             # Use x86_64 Python environment
             cmd = [
                 "arch",
                 "-x86_64",
                 str(x86_venv_path / "bin" / "pyinstaller"),
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -768,7 +779,7 @@ class PackageCommand(Command):
                 "poetry",
                 "run",
                 "pyinstaller",
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--target-arch={arch}",
@@ -793,7 +804,8 @@ class PackageCommand(Command):
             console.print(f"[red]PyInstaller build failed: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
+        # `--onedir` output layout: `{distpath}/{name}/{name}` (launcher).
+        binary_path = output_dir / binary_name / binary_name
         if binary_path.exists():
             binary_path.chmod(0o755)
             console.print(f"[green]✓ macOS {arch} binary built successfully with PyInstaller[/green]")
@@ -825,12 +837,21 @@ class PackageCommand(Command):
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command.
+        #
+        # NOTE: `--onedir` is intentional. `--onefile` extracts the bundled
+        # archive to a per-invocation temp directory (`/tmp/_MEI*`) at startup
+        # and cleans it up via an atexit hook. Abnormal termination (SIGKILL,
+        # OOM, hard timeout) bypasses that hook and leaves the directory
+        # behind, so under credential_process workloads that get killed by
+        # boto3 timeouts the extraction directories accumulate and can fill
+        # `/tmp`. `--onedir` avoids the extraction entirely: the launcher
+        # runs directly from its install location.
         cmd = [
             "poetry",
             "run",
             "pyinstaller",
-            "--onefile",
+            "--onedir",
             "--clean",
             "--noconfirm",
             f"--name={binary_name}",
@@ -858,7 +879,10 @@ class PackageCommand(Command):
             console.print(f"[red]PyInstaller build failed: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
+        # `--onedir` output layout: `{distpath}/{name}/{name}` (launcher) plus
+        # `{distpath}/{name}/_internal/` (dependencies). Return the launcher
+        # path; the containing directory is the shipping unit.
+        binary_path = output_dir / binary_name / binary_name
         if binary_path.exists():
             binary_path.chmod(0o755)
             console.print("[green]✓ Linux binary built successfully with PyInstaller[/green]")
@@ -955,9 +979,14 @@ WORKDIR /build
 # Copy source code
 COPY credential_provider /build/credential_provider
 
-# Build the binary with PyInstaller
+# Build the binary with PyInstaller.
+#
+# NOTE: `--onedir` is intentional. `--onefile` extracts to `/tmp/_MEI*`
+# at startup and cleans up via atexit; abnormal termination bypasses
+# that cleanup and leaks the directory. `--onedir` runs directly
+# from the install location.
 RUN pyinstaller \
-    --onefile \
+    --onedir \
     --clean \
     --noconfirm \
     --name {binary_name} \
@@ -975,7 +1004,8 @@ RUN pyinstaller \
     --hidden-import dateutil \
     credential_provider/__main__.py
 
-# The binary will be in /output/{binary_name}
+# The binary tree will be in /output/{binary_name}/ with the launcher at
+# /output/{binary_name}/{binary_name}.
 """
 
             (temp_path / "Dockerfile").write_text(dockerfile_content)
@@ -1034,7 +1064,10 @@ RUN pyinstaller \
                 raise RuntimeError(f"Failed to create container: {run_result.stderr}")
 
             try:
-                # Copy binary from container
+                # Copy binary tree from container. `docker cp` handles
+                # directories transparently: copying `/output/{name}`
+                # yields `output_dir/{name}/` with the launcher at
+                # `output_dir/{name}/{name}`.
                 copy_result = subprocess.run(
                     ["docker", "cp", f"{container_name}:/output/{binary_name}", str(output_dir)],
                     capture_output=True,
@@ -1044,8 +1077,8 @@ RUN pyinstaller \
                 if copy_result.returncode != 0:
                     raise RuntimeError(f"Failed to copy binary from container: {copy_result.stderr}")
 
-                # Verify the binary was created
-                binary_path = output_dir / binary_name
+                # Verify the launcher exists inside the copied directory
+                binary_path = output_dir / binary_name / binary_name
                 if not binary_path.exists():
                     raise RuntimeError(f"Linux {arch} binary was not created successfully")
 
@@ -1138,9 +1171,13 @@ WORKDIR /build
 # Copy source code
 COPY otel_helper /build/otel_helper
 
-# Build the binary with PyInstaller
+# Build the binary with PyInstaller.
+#
+# NOTE: `--onedir` matches the credential-process build. See the
+# comment in the credential-process Dockerfile above for the leak
+# rationale.
 RUN pyinstaller \
-    --onefile \
+    --onedir \
     --clean \
     --noconfirm \
     --name {binary_name} \
@@ -1152,7 +1189,8 @@ RUN pyinstaller \
     --hidden-import six.moves \
     otel_helper/__main__.py
 
-# The binary will be in /output/{binary_name}
+# The binary tree will be in /output/{binary_name}/ with the launcher
+# at /output/{binary_name}/{binary_name}.
 """
 
             (temp_path / "Dockerfile").write_text(dockerfile_content)
@@ -1211,7 +1249,10 @@ RUN pyinstaller \
                 raise RuntimeError(f"Failed to create container: {run_result.stderr}")
 
             try:
-                # Copy binary from container
+                # Copy binary tree from container. `docker cp` handles
+                # directories transparently: copying `/output/{name}`
+                # yields `output_dir/{name}/` with the launcher at
+                # `output_dir/{name}/{name}`.
                 copy_result = subprocess.run(
                     ["docker", "cp", f"{container_name}:/output/{binary_name}", str(output_dir)],
                     capture_output=True,
@@ -1221,8 +1262,8 @@ RUN pyinstaller \
                 if copy_result.returncode != 0:
                     raise RuntimeError(f"Failed to copy OTEL binary from container: {copy_result.stderr}")
 
-                # Verify the binary was created
-                binary_path = output_dir / binary_name
+                # Verify the launcher exists inside the copied directory
+                binary_path = output_dir / binary_name / binary_name
                 if not binary_path.exists():
                     raise RuntimeError(f"Linux {arch} OTEL helper binary was not created successfully")
 
@@ -1410,19 +1451,43 @@ RUN pyinstaller \
             if pyproject_file.exists():
                 zf.write(pyproject_file, "pyproject.toml")
 
+            # Add Windows forwarding-stub C source. This is compiled
+            # inside the CodeBuild Windows image via MinGW (already on
+            # PATH there) into `credential-process.exe` and
+            # `otel-helper.exe` sibling shims. See
+            # source/windows_stubs/credential_process_stub.c for the
+            # rationale.
+            windows_stubs_dir = source_dir / "windows_stubs"
+            if windows_stubs_dir.exists() and windows_stubs_dir.is_dir():
+                for c_file in windows_stubs_dir.rglob("*.c"):
+                    arcname = str(c_file.relative_to(source_dir.parent))
+                    zf.write(c_file, arcname)
+
         return source_zip
 
     def _build_otel_helper(self, output_dir: Path, target_platform: str) -> Path:
         """Build executable for OTEL helper script."""
-        # Windows uses Nuitka via CodeBuild
+        # Windows uses Nuitka via CodeBuild.
+        #
+        # After the MEI-leak fix the Windows otel-helper artifact is a
+        # directory tree named `otel-helper-windows/` (the buildspec
+        # renames Nuitka's `<name>.exe.dist/` output for cross-platform
+        # naming consistency) with the launcher at
+        # `otel-helper-windows/otel-helper-windows.exe`. Detect both the
+        # post-fix directory shape and the legacy pre-fix single-file
+        # shape so this works during upgrade.
         if target_platform == "windows":
-            # Check if the Windows binary already exists (built by _build_executable)
-            windows_binary = output_dir / "otel-helper-windows.exe"
-            if windows_binary.exists():
-                return windows_binary
-            else:
-                # If not, we need to build via CodeBuild (but this should have been done already)
-                raise RuntimeError("Windows otel-helper should have been built with credential-process")
+            windows_dir = output_dir / "otel-helper-windows"
+            windows_launcher = windows_dir / "otel-helper-windows.exe"
+            if windows_dir.is_dir() and windows_launcher.exists():
+                return windows_launcher
+            legacy_single = output_dir / "otel-helper-windows.exe"
+            if legacy_single.is_file():
+                return legacy_single
+            raise RuntimeError(
+                "Windows otel-helper should have been built with credential-process "
+                f"(expected either {windows_launcher} or {legacy_single})"
+            )
 
         # macOS builds use PyInstaller
         if target_platform == "macos-arm64":
@@ -1503,14 +1568,17 @@ RUN pyinstaller \
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command.
+        #
+        # NOTE: `--onedir` matches the credential-process build. See the
+        # comment in _build_linux_pyinstaller for the leak rationale.
         if use_x86_python:
             # Use x86_64 Python environment
             cmd = [
                 "arch",
                 "-x86_64",
                 str(x86_venv_path / "bin" / "pyinstaller"),
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -1526,7 +1594,7 @@ RUN pyinstaller \
                 "poetry",
                 "run",
                 "pyinstaller",
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -1549,7 +1617,8 @@ RUN pyinstaller \
             console.print(f"[red]PyInstaller build failed for OTEL helper: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
+        # `--onedir` output layout: `{distpath}/{name}/{name}` (launcher).
+        binary_path = output_dir / binary_name / binary_name
         if binary_path.exists():
             binary_path.chmod(0o755)
             console.print("[green]✓ OTEL helper built successfully with PyInstaller[/green]")
@@ -1582,8 +1651,20 @@ RUN pyinstaller \
                 platform_variant = "intel"
                 binary_name = "otel-helper-macos-intel"
         elif target_platform == "linux":
-            platform_variant = "x86_64"
-            binary_name = "otel-helper-linux"
+            # Match install.sh's BINARY_SUFFIX detection: it looks for
+            # `otel-helper-linux-x64` or `otel-helper-linux-arm64` based
+            # on the host machine. The previous name `otel-helper-linux`
+            # (with no arch suffix) never matched what install.sh
+            # searches for on either arch; this alignment is a pre-fix
+            # bug that only manifests if anyone actually uses the native
+            # Nuitka Linux otel-helper path (the primary path is
+            # PyInstaller-onedir via `_build_otel_helper_pyinstaller`).
+            if current_machine in ("aarch64", "arm64"):
+                platform_variant = "arm64"
+                binary_name = "otel-helper-linux-arm64"
+            else:
+                platform_variant = "x86_64"
+                binary_name = "otel-helper-linux-x64"
         else:
             raise ValueError(f"Unsupported target platform: {target_platform}")
 
@@ -1621,11 +1702,14 @@ RUN pyinstaller \
                 "nuitka",
             ]
 
-        # Add common Nuitka flags
+        # Add common Nuitka flags.
+        #
+        # NOTE: `--standalone` without `--onefile` matches the
+        # credential-process build. See the comment in
+        # _build_native_executable_nuitka for the leak rationale.
         cmd.extend(
             [
                 "--standalone",
-                "--onefile",
                 "--assume-yes-for-downloads",
                 f"--output-filename={binary_name}",
                 f"--output-dir={str(output_dir)}",
@@ -1644,12 +1728,6 @@ RUN pyinstaller \
                     "--disable-console",
                 ]
             )
-        elif target_platform == "linux":
-            cmd.extend(
-                [
-                    "--linux-onefile-icon=NONE",
-                ]
-            )
 
         # Add the source file
         cmd.append(str(src_file))
@@ -1660,7 +1738,8 @@ RUN pyinstaller \
         if result.returncode != 0:
             raise RuntimeError(f"Nuitka build failed for OTEL helper: {result.stderr}")
 
-        return output_dir / binary_name
+        # `--standalone` output layout: `{output-dir}/{name}.dist/{name}`.
+        return output_dir / f"{binary_name}.dist" / binary_name
 
     def _create_config(
         self,
@@ -1814,11 +1893,18 @@ else
     exit 1
 fi
 
-# Check if binary for platform exists
+# Check if binary tree for platform exists.
+#
+# The build now ships each binary as a directory (see MEI-leak fix).
+# The install layout below places that directory at
+# `~/claude-code-with-bedrock/credential-process-dist/` and creates a
+# backward-compatible symlink at `~/claude-code-with-bedrock/credential-process`
+# so pre-existing `~/.aws/config` entries continue to work without
+# any user action.
 CREDENTIAL_BINARY="credential-process-$BINARY_SUFFIX"
 OTEL_BINARY="otel-helper-$BINARY_SUFFIX"
 
-if [ ! -f "$CREDENTIAL_BINARY" ]; then
+if [ ! -d "$CREDENTIAL_BINARY" ]; then
     echo "❌ Binary not found for your platform: $CREDENTIAL_BINARY"
     echo "   Please ensure you have the correct package for your architecture."
     exit 1
@@ -1826,17 +1912,31 @@ fi
 """
 
         installer_content += f"""
-# Create directory
+# Create install directory
 echo
 echo "Installing authentication tools..."
 mkdir -p ~/claude-code-with-bedrock
 
-# Copy appropriate binary
-cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
+# Install credential-process.
+#
+# The binary is shipped as a directory tree (see MEI-leak fix): a
+# launcher plus its `_internal/` deps. We move that tree into
+# `~/claude-code-with-bedrock/credential-process-dist/` and expose a
+# backward-compatible entry at `~/claude-code-with-bedrock/credential-process`
+# via a symlink so existing `~/.aws/config` entries pointing at
+# `~/claude-code-with-bedrock/credential-process` continue to work.
+#
+# Upgrade handling: if a pre-fix single-file `credential-process` is
+# present from an earlier install, remove it before creating the
+# symlink. Same for a stale dist directory from a previous upgrade.
+rm -rf ~/claude-code-with-bedrock/credential-process-dist
+rm -f ~/claude-code-with-bedrock/credential-process
+cp -R "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process-dist
+chmod +x "$HOME/claude-code-with-bedrock/credential-process-dist/$CREDENTIAL_BINARY"
+ln -s "credential-process-dist/$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
 
 # Copy config
 cp config.json ~/claude-code-with-bedrock/
-chmod +x ~/claude-code-with-bedrock/credential-process
 
 # macOS Keychain Notice
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -1880,21 +1980,31 @@ if [ -d "claude-settings" ]; then
     fi
 fi
 
-# Copy OTEL helper executable and shell wrapper if present
-if [ -f "$OTEL_BINARY" ]; then
+# Copy OTEL helper executable tree and shell wrapper if present.
+#
+# Same directory-artifact treatment as credential-process. Legacy
+# invocation paths remain valid via a symlink at otel-helper-bin.
+if [ -d "$OTEL_BINARY" ]; then
     echo
     echo "Installing OTEL helper..."
-    # Install PyInstaller binary as otel-helper-bin (fallback for cache miss)
-    cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper-bin
-    chmod +x ~/claude-code-with-bedrock/otel-helper-bin
-    # Install shell wrapper as otel-helper (fast cache check, avoids PyInstaller startup)
+    # Install the onedir binary tree at otel-helper-dist and expose the
+    # launcher at otel-helper-bin via a symlink (fallback for shell-
+    # wrapper cache miss).
+    rm -rf ~/claude-code-with-bedrock/otel-helper-dist
+    rm -f ~/claude-code-with-bedrock/otel-helper-bin
+    cp -R "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper-dist
+    chmod +x "$HOME/claude-code-with-bedrock/otel-helper-dist/$OTEL_BINARY"
+    ln -s "otel-helper-dist/$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper-bin
+    # Install shell wrapper as otel-helper (fast cache check, avoids
+    # PyInstaller startup on every invocation).
+    rm -f ~/claude-code-with-bedrock/otel-helper
     if [ -f "otel-helper.sh" ]; then
         cp "otel-helper.sh" ~/claude-code-with-bedrock/otel-helper
         chmod +x ~/claude-code-with-bedrock/otel-helper
     else
-        # Fallback: if shell wrapper not in package, point directly to binary
-        cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper
-        chmod +x ~/claude-code-with-bedrock/otel-helper
+        # Fallback: if shell wrapper not in package, point directly at
+        # the launcher via the same symlink target.
+        ln -s "otel-helper-dist/$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper
     fi
     echo "✓ OTEL helper installed"
 fi
@@ -2017,19 +2127,44 @@ REM Create directory
 echo Installing authentication tools...
 if not exist "%USERPROFILE%\\claude-code-with-bedrock" mkdir "%USERPROFILE%\\claude-code-with-bedrock"
 
-REM Copy credential process executable with renamed target
+REM Install credential-process.
+REM
+REM The binary is shipped as a directory tree (see MEI-leak fix): a
+REM launcher .exe plus its dependencies. Move that tree into
+REM %USERPROFILE%\claude-code-with-bedrock\credential-process-dist\
+REM and place a tiny forwarding stub at
+REM %USERPROFILE%\claude-code-with-bedrock\credential-process.exe
+REM which is a real PE executable that CreateProcesses the real
+REM launcher inside the dist directory. Existing ~/.aws/config
+REM entries pointing at credential-process.exe keep working with
+REM zero user action; boto3's shell=False Popen honours the .exe
+REM path directly.
+REM
+REM Upgrade handling: remove any stale dist directory before copying
+REM (the .exe stub itself is replaced by the copy /Y below).
 echo Copying credential process...
-copy /Y "credential-process-windows.exe" "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe" >nul
+if exist "%USERPROFILE%\\claude-code-with-bedrock\\credential-process-dist" rmdir /S /Q "%USERPROFILE%\\claude-code-with-bedrock\\credential-process-dist"
+xcopy /E /I /Y "credential-process-windows" "%USERPROFILE%\\claude-code-with-bedrock\\credential-process-dist" >nul
 if %errorlevel% neq 0 (
-    echo ERROR: Failed to copy credential-process-windows.exe
+    echo ERROR: Failed to copy credential-process-windows tree
+    pause
+    exit /b 1
+)
+copy /Y "credential-process.exe" "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe" >nul
+if %errorlevel% neq 0 (
+    echo ERROR: Failed to copy credential-process.exe forwarding stub
     pause
     exit /b 1
 )
 
-REM Copy OTEL helper if it exists with renamed target
-if exist "otel-helper-windows.exe" (
+REM Install OTEL helper if it exists (same directory-artifact + stub treatment).
+if exist "otel-helper-windows" (
     echo Copying OTEL helper...
-    copy /Y "otel-helper-windows.exe" "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper.exe" >nul
+    if exist "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper-dist" rmdir /S /Q "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper-dist"
+    xcopy /E /I /Y "otel-helper-windows" "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper-dist" >nul
+    if exist "otel-helper.exe" (
+        copy /Y "otel-helper.exe" "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper.exe" >nul
+    )
 )
 
 REM Copy configuration
@@ -2054,7 +2189,11 @@ if exist "claude-settings" (
         )
 
         if not "%SKIP_SETTINGS%"=="true" (
-            REM Use PowerShell to replace placeholders
+            REM Use PowerShell to replace placeholders. After the MEI-
+            REM leak fix the .exe at this path is a small forwarding
+            REM stub that CreateProcesses the real launcher inside the
+            REM sibling dist directory; the invocation path itself is
+            REM unchanged from the pre-fix install.
             powershell -Command ^
             "$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper.exe' ^
             -replace '\\\\\\\\', '/'; ^
@@ -2083,7 +2222,10 @@ for /f %%p in ('powershell -Command ^
     "& {{$c=Get-Content config.json|ConvertFrom-Json;$c.'%%p'.aws_region}}"') do set PROFILE_REGION=%%r
 
 
-    REM Set credential process with --profile flag (cross-platform, no wrapper needed)
+    REM Set credential process with --profile flag. The .exe at this
+    REM path is a forwarding stub (see MEI-leak fix); the invocation
+    REM path is unchanged from the pre-fix install so existing configs
+    REM keep working.
     aws configure set credential_process ^
     "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe --profile %%p" --profile %%p
 

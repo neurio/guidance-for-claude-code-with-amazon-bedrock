@@ -156,21 +156,53 @@ Resources:
             build:
               commands:
                 - echo Building Windows executables sequentially...
+                # NOTE: `--standalone` without `--onefile` is intentional. `--onefile`
+                # extracts the bundled archive to a per-invocation temp directory
+                # (%TEMP%\onefile_*) at startup and cleans up via atexit. Abnormal
+                # termination bypasses that cleanup and leaks the directory. In
+                # production this filled /tmp on Linux hosts running under WSL;
+                # the same failure mode applies on Windows. `--standalone`
+                # produces a `.dist` folder tree instead of a onefile bundle,
+                # so there is no runtime extraction and nothing to leak.
                 - echo Building credential-process Windows executable...
-                - C:\Python312\python.exe -m nuitka --standalone --onefile --assume-yes-for-downloads --mingw64 --company-name="Claude Code" --product-name="Claude Code Credential Process" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="AWS Credential Process for Claude Code" --include-package=keyring.backends --output-filename=credential-process-windows.exe --output-dir=. --remove-output source/credential_provider/__main__.py
+                - C:\Python312\python.exe -m nuitka --standalone --assume-yes-for-downloads --mingw64 --company-name="Claude Code" --product-name="Claude Code Credential Process" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="AWS Credential Process for Claude Code" --include-package=keyring.backends --output-filename=credential-process-windows.exe --output-dir=. --remove-output source/credential_provider/__main__.py
                 - echo Building otel-helper Windows executable...
-                - C:\Python312\python.exe -m nuitka --standalone --onefile --assume-yes-for-downloads --mingw64 --company-name="Claude Code" --product-name="Claude Code OTEL Helper" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="OpenTelemetry Helper for Claude Code" --output-filename=otel-helper-windows.exe --output-dir=. --remove-output source/otel_helper/__main__.py
+                - C:\Python312\python.exe -m nuitka --standalone --assume-yes-for-downloads --mingw64 --company-name="Claude Code" --product-name="Claude Code OTEL Helper" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="OpenTelemetry Helper for Claude Code" --output-filename=otel-helper-windows.exe --output-dir=. --remove-output source/otel_helper/__main__.py
+                # Nuitka standalone produces `<name>.exe.dist/` folders.
+                # Rename them to match the Linux/macOS naming convention
+                # `<name>` (no `.exe`, no `.dist`), so the installer can
+                # treat every platform's artifact the same way.
+                - Rename-Item credential-process-windows.exe.dist credential-process-windows
+                - Rename-Item otel-helper-windows.exe.dist otel-helper-windows
+                # Compile the tiny forwarding shims. These are real PE
+                # executables (~30 KB each) whose sole job is to locate
+                # the sibling `*-dist/` directory and CreateProcess the
+                # real launcher inside it. They exist because boto3's
+                # `credential_process` runner on Windows uses
+                # `subprocess.Popen(shell=False)` which does not honour
+                # PATHEXT, so existing `~/.aws/config` entries pointing
+                # at `credential-process.exe` need a real .exe to keep
+                # working after the onefile-to-standalone switch.
+                #
+                # MinGW is already on PATH (used by Nuitka above via
+                # `--mingw64`). `-Os -s` produces a stripped, size-
+                # optimised binary with no runtime deps beyond Win32.
+                - echo Compiling credential-process forwarding stub...
+                - x86_64-w64-mingw32-gcc source/windows_stubs/credential_process_stub.c '-DTARGET_DIST_DIR="credential-process-dist"' '-DTARGET_LAUNCHER="credential-process-windows.exe"' -o credential-process.exe -Os -s -municode
+                - echo Compiling otel-helper forwarding stub...
+                - x86_64-w64-mingw32-gcc source/windows_stubs/credential_process_stub.c '-DTARGET_DIST_DIR="otel-helper-dist"' '-DTARGET_LAUNCHER="otel-helper-windows.exe"' -o otel-helper.exe -Os -s -municode
             post_build:
               commands:
                 - echo Build completed successfully
-                - Get-ChildItem *.exe
-                - echo Checking file sizes...
-                - Get-ChildItem *.exe | ForEach-Object { Write-Host "$($_.Name) - $($_.Length) bytes" }
+                - Get-ChildItem credential-process-windows, otel-helper-windows, credential-process.exe, otel-helper.exe
+                - Get-ChildItem credential-process-windows, otel-helper-windows -Recurse | Measure-Object -Property Length -Sum
 
           artifacts:
             files:
-              - credential-process-windows.exe
-              - otel-helper-windows.exe
+              - credential-process-windows/**/*
+              - otel-helper-windows/**/*
+              - credential-process.exe
+              - otel-helper.exe
             name: windows-binaries
 
       LogsConfig:
