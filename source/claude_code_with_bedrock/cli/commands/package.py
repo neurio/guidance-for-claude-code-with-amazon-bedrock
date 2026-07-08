@@ -1467,15 +1467,27 @@ RUN pyinstaller \
 
     def _build_otel_helper(self, output_dir: Path, target_platform: str) -> Path:
         """Build executable for OTEL helper script."""
-        # Windows uses Nuitka via CodeBuild
+        # Windows uses Nuitka via CodeBuild.
+        #
+        # After the MEI-leak fix the Windows otel-helper artifact is a
+        # directory tree named `otel-helper-windows/` (the buildspec
+        # renames Nuitka's `<name>.exe.dist/` output for cross-platform
+        # naming consistency) with the launcher at
+        # `otel-helper-windows/otel-helper-windows.exe`. Detect both the
+        # post-fix directory shape and the legacy pre-fix single-file
+        # shape so this works during upgrade.
         if target_platform == "windows":
-            # Check if the Windows binary already exists (built by _build_executable)
-            windows_binary = output_dir / "otel-helper-windows.exe"
-            if windows_binary.exists():
-                return windows_binary
-            else:
-                # If not, we need to build via CodeBuild (but this should have been done already)
-                raise RuntimeError("Windows otel-helper should have been built with credential-process")
+            windows_dir = output_dir / "otel-helper-windows"
+            windows_launcher = windows_dir / "otel-helper-windows.exe"
+            if windows_dir.is_dir() and windows_launcher.exists():
+                return windows_launcher
+            legacy_single = output_dir / "otel-helper-windows.exe"
+            if legacy_single.is_file():
+                return legacy_single
+            raise RuntimeError(
+                "Windows otel-helper should have been built with credential-process "
+                f"(expected either {windows_launcher} or {legacy_single})"
+            )
 
         # macOS builds use PyInstaller
         if target_platform == "macos-arm64":
@@ -1639,8 +1651,20 @@ RUN pyinstaller \
                 platform_variant = "intel"
                 binary_name = "otel-helper-macos-intel"
         elif target_platform == "linux":
-            platform_variant = "x86_64"
-            binary_name = "otel-helper-linux"
+            # Match install.sh's BINARY_SUFFIX detection: it looks for
+            # `otel-helper-linux-x64` or `otel-helper-linux-arm64` based
+            # on the host machine. The previous name `otel-helper-linux`
+            # (with no arch suffix) never matched what install.sh
+            # searches for on either arch; this alignment is a pre-fix
+            # bug that only manifests if anyone actually uses the native
+            # Nuitka Linux otel-helper path (the primary path is
+            # PyInstaller-onedir via `_build_otel_helper_pyinstaller`).
+            if current_machine in ("aarch64", "arm64"):
+                platform_variant = "arm64"
+                binary_name = "otel-helper-linux-arm64"
+            else:
+                platform_variant = "x86_64"
+                binary_name = "otel-helper-linux-x64"
         else:
             raise ValueError(f"Unsupported target platform: {target_platform}")
 

@@ -524,11 +524,20 @@ class DistributeCommand(Command):
         # Map available binaries to platforms
         console.print("\n[bold]Scanning package directory...[/bold]")
 
-        # Platform file mappings
+        # Platform file mappings.
+        #
+        # NOTE: Executable artifacts are now directories (see MEI-leak
+        # fix); `_add_to_zip` recurses into directories. The Windows
+        # entries drop the `.exe` suffix because the buildspec renames
+        # Nuitka's output to a plain name for cross-platform consistency,
+        # and additionally include the forwarding stub `.exe` at the top
+        # level of the package.
         platform_files = {
             "windows": [
-                ("credential-process-windows.exe", "credential-process-windows.exe"),
-                ("otel-helper-windows.exe", "otel-helper-windows.exe"),
+                ("credential-process-windows", "credential-process-windows"),
+                ("credential-process.exe", "credential-process.exe"),
+                ("otel-helper-windows", "otel-helper-windows"),
+                ("otel-helper.exe", "otel-helper.exe"),
                 ("install.bat", "install.bat"),
                 ("config.json", "config.json"),
                 ("README.md", "README.md"),
@@ -713,8 +722,14 @@ class DistributeCommand(Command):
             console.print(f"  ✓ macOS Intel executable (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
             found_platforms.append("macos-intel")
 
-        # Check for Windows executables
-        windows_exe = package_path / "credential-process-windows.exe"
+        # Check for Windows executables. After the MEI-leak fix the
+        # Windows artifact is `credential-process-windows/` (directory,
+        # no `.exe`) plus a `credential-process.exe` forwarding stub.
+        # Detect either shape so this command works against both post-
+        # fix and pre-fix packages.
+        windows_dir = package_path / "credential-process-windows"
+        windows_exe_legacy = package_path / "credential-process-windows.exe"
+        windows_exe = windows_dir if windows_dir.is_dir() else windows_exe_legacy
         windows_exe_time = None
         if windows_exe.exists():
             from datetime import timezone
@@ -1131,20 +1146,32 @@ class DistributeCommand(Command):
         package_temp_dir = temp_dir / "claude-code-package"
         package_temp_dir.mkdir(exist_ok=True)
 
-        # Files to include in the package
+        # Files to include in the package.
+        #
+        # NOTE: Executable artifacts are now directories, not single files
+        # (see MEI-leak fix). `_copy_artifact` and `_add_to_zip` handle
+        # both shapes. The Windows names are `credential-process-windows`
+        # (no `.exe`) and `otel-helper-windows` (no `.exe`) because the
+        # buildspec renames Nuitka's `<name>.exe.dist/` output to `<name>/`
+        # for cross-platform naming consistency. The `.exe` entries in
+        # this list are the small forwarding stubs compiled alongside.
         required_files = [
-            # Executables for each platform
+            # Executable directories for each platform
             "credential-process-macos-arm64",
             "credential-process-macos-intel",
             "credential-process-linux-x64",
             "credential-process-linux-arm64",
-            "credential-process-windows.exe",
-            # OTEL helpers
+            "credential-process-windows",
+            # Windows forwarding stub (real .exe that CreateProcesses the
+            # launcher inside credential-process-windows/)
+            "credential-process.exe",
+            # OTEL helper directories
             "otel-helper-macos-arm64",
             "otel-helper-macos-intel",
             "otel-helper-linux-x64",
             "otel-helper-linux-arm64",
-            "otel-helper-windows.exe",
+            "otel-helper-windows",
+            "otel-helper.exe",
             # Installation scripts
             "install.sh",
             "install.bat",

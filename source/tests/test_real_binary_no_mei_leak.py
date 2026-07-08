@@ -180,6 +180,11 @@ def _build_otel_helper(build_output_dir: Path) -> Path:
     """Build the real ``otel-helper`` binary for the current platform.
 
     Returns the launcher path.
+
+    On Windows the otel-helper is only built via CodeBuild (not from
+    Python code), so we do not have a native Nuitka entry point for it.
+    The test class that consumes this helper skips Windows for that
+    reason (see ``_SKIP_WINDOWS_OTEL`` below).
     """
     cmd = _make_package_command_for_build()
 
@@ -189,11 +194,10 @@ def _build_otel_helper(build_output_dir: Path) -> Path:
     if system == "Darwin":
         arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x86_64"
         return cmd._build_otel_helper_pyinstaller(build_output_dir, "macos", arch)
-    if system == "Windows":
-        # otel-helper on Windows also builds via Nuitka; the method
-        # signature mirrors credential-process. See package.py.
-        return cmd._build_native_executable_nuitka(build_output_dir, "windows")
-    raise RuntimeError(f"unsupported platform for build: {system}")
+    raise RuntimeError(
+        f"unsupported platform for otel-helper build: {system}. "
+        f"On Windows the otel-helper is only built via CodeBuild."
+    )
 
 
 def _run_binary_and_watch_for_leaks(
@@ -317,16 +321,27 @@ def _assert_artifact_is_directory(launcher_path: Path) -> None:
     # Windows executables end in .exe; strip for comparison.
     launcher_stem = launcher_name[:-4] if launcher_name.endswith(".exe") else launcher_name
 
+    # Recognised directory-shape parents, in decreasing order of
+    # canonicality:
+    #   1. PyInstaller onedir:    `dist/<name>/<name>` — parent name matches launcher stem.
+    #   2. Buildspec-renamed Nuitka standalone:
+    #                              `dist/<name>/<name>.exe` — parent name matches launcher stem (with .exe stripped).
+    #   3. Raw Nuitka standalone (before any rename):
+    #                              `dist/<name>.exe.dist/<name>.exe` — parent name is `<launcher-name>.dist`.
+    #   4. Nuitka standalone Unix (no .exe suffix on launcher):
+    #                              `dist/<name>.dist/<name>` — parent name is `<launcher-name>.dist`.
     is_pyinstaller_onedir = parent.name == launcher_stem
-    is_nuitka_standalone = parent.name == f"{launcher_stem}.dist"
+    is_nuitka_dist_stripped = parent.name == f"{launcher_stem}.dist"
+    is_nuitka_dist_raw = parent.name == f"{launcher_name}.dist"
 
-    assert is_pyinstaller_onedir or is_nuitka_standalone, (
+    assert is_pyinstaller_onedir or is_nuitka_dist_stripped or is_nuitka_dist_raw, (
         f"launcher at {launcher_path} is not inside a onedir/standalone "
         f"directory. parent={parent.name!r}, expected {launcher_stem!r} "
-        f"(PyInstaller onedir) or {launcher_stem + '.dist'!r} "
-        f"(Nuitka standalone). If parent is 'dist' or similar, the build "
-        f"is still producing a single-file executable and the MEI leak "
-        f"fix has regressed."
+        f"(PyInstaller onedir), {launcher_stem + '.dist'!r} "
+        f"(Nuitka standalone, renamed or Unix), or {launcher_name + '.dist'!r} "
+        f"(Nuitka standalone, raw Windows output). If parent is 'dist' or "
+        f"similar, the build is still producing a single-file executable "
+        f"and the MEI leak fix has regressed."
     )
 
 
@@ -397,6 +412,11 @@ class TestCredentialProcessBinary:
         _assert_no_leak_during_run(launcher, args=["--version"])
 
 
+@pytest.mark.skipif(
+    platform.system() == "Windows",
+    reason="otel-helper on Windows is built only via CodeBuild, not from Python code; "
+    "no native build entry point exists to exercise here.",
+)
 class TestOtelHelperBinary:
     """The shipped ``otel-helper`` binary must not leak tmp dirs."""
 
