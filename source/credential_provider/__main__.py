@@ -32,7 +32,8 @@ import requests
 from botocore import UNSIGNED
 from botocore.config import Config
 
-# No longer using file locks - using port-based locking instead
+# Uses port-based locking: if the OAuth callback port is occupied by another
+# credential-process, wait for it to complete and read credentials from cache.
 
 __version__ = "1.0.0"
 
@@ -40,8 +41,8 @@ __version__ = "1.0.0"
 PROVIDER_CONFIGS = {
     "okta": {
         "name": "Okta",
-        "authorize_endpoint": "/oauth2/v1/authorize",
-        "token_endpoint": "/oauth2/v1/token",
+        "authorize_endpoint": "/oauth2/{auth_server}/v1/authorize",
+        "token_endpoint": "/oauth2/{auth_server}/v1/token",  # nosec B105
         "scopes": "openid profile email",
         "response_type": "code",
         "response_mode": "query",
@@ -70,6 +71,24 @@ PROVIDER_CONFIGS = {
         "response_type": "code",
         "response_mode": "query",
     },
+    "google": {
+        "name": "Google",
+        "authorize_endpoint": "/o/oauth2/v2/auth",
+        "token_endpoint": "https://oauth2.googleapis.com/token",  # nosec B105
+        "scopes": "openid profile email",
+        "response_type": "code",
+        "response_mode": "query",
+    },
+    # Generic OIDC: paths come from the profile (oidc_authorization_endpoint /
+    # oidc_token_endpoint), so we leave these as empty placeholders.
+    "generic": {
+        "name": "Generic OIDC",
+        "authorize_endpoint": "",
+        "token_endpoint": "",
+        "scopes": "openid profile email",
+        "response_type": "code",
+        "response_mode": "query",
+    },
 }
 
 
@@ -84,19 +103,44 @@ class MultiProviderAuth:
 
         self.config = self._load_config()
 
+        # SSO-disabled profiles use the ambient credential chain (e.g. AWS Identity Center).
+        # Skip all OIDC/Cognito setup — nothing below is needed.
+        self.sso_enabled = self.config.get("sso_enabled", True)
+        if not self.sso_enabled:
+            return
+
         # Determine provider type from domain
         self.provider_type = self._determine_provider_type()
 
         # Fail clearly if provider type is unknown
         if self.provider_type not in PROVIDER_CONFIGS:
             raise ValueError(
-                f"Unknown provider type '{self.provider_type}'. "
-                f"Valid providers: {', '.join(PROVIDER_CONFIGS.keys())}"
+                f"Unknown provider type '{self.provider_type}'. Valid providers: {', '.join(PROVIDER_CONFIGS.keys())}"
             )
-        self.provider_config = PROVIDER_CONFIGS[self.provider_type]
+        self.provider_config = dict(PROVIDER_CONFIGS[self.provider_type])
 
-        # OAuth configuration
-        self.redirect_port = int(os.getenv("REDIRECT_PORT", "8400"))
+        # For Okta, resolve the authorization server in endpoint paths.
+        # "default" = Okta custom auth server (free/developer plans).
+        # Empty string with trailing slash removed = Org auth server (paid plans).
+        if self.provider_type == "okta":
+            auth_server = self.config.get("okta_auth_server", "")
+            if auth_server:
+                self.provider_config["authorize_endpoint"] = self.provider_config["authorize_endpoint"].format(
+                    auth_server=auth_server
+                )
+                self.provider_config["token_endpoint"] = self.provider_config["token_endpoint"].format(
+                    auth_server=auth_server
+                )
+            else:
+                # Org auth server (paid plans) — no auth server ID in path
+                self.provider_config["authorize_endpoint"] = "/oauth2/v1/authorize"
+                self.provider_config["token_endpoint"] = "/oauth2/v1/token"  # nosec B105
+
+        # OAuth callback port — also used for inter-process locking.
+        # Precedence: REDIRECT_PORT env var > config.json redirect_port > default 8400
+        env_port = os.getenv("REDIRECT_PORT")
+        config_port = self.config.get("redirect_port")
+        self.redirect_port = int(env_port) if env_port else int(config_port) if config_port else 8400
         self.redirect_uri = f"http://localhost:{self.redirect_port}/callback"
 
         # Initialize credential storage
@@ -106,6 +150,33 @@ class MultiProviderAuth:
         """Print debug message only if debug mode is enabled"""
         if self.debug:
             print(f"Debug: {message}", file=sys.stderr)
+
+    def _wait_for_auth_completion(self, timeout=60):
+        """Wait for another process to complete authentication using port-based detection"""
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                test_socket.bind(("127.0.0.1", self.redirect_port))
+                test_socket.close()
+                cached = self.get_cached_credentials()
+                if cached:
+                    return cached
+                else:
+                    return None
+            except OSError as e:
+                if e.errno == errno.EADDRINUSE:
+                    time.sleep(0.5)
+                else:
+                    raise
+            finally:
+                try:
+                    test_socket.close()
+                except Exception:
+                    pass  # nosec B110
+
+        return None
 
     def _auto_detect_profile(self):
         """Auto-detect profile name from config.json when only one profile exists."""
@@ -121,7 +192,7 @@ class MultiProviderAuth:
             if not config_path.exists():
                 return None
 
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 file_config = json.load(f)
 
             # New format with "profiles" key
@@ -162,7 +233,7 @@ class MultiProviderAuth:
                 f"Configuration file not found in {binary_dir} or {Path.home() / 'claude-code-with-bedrock'}"
             )
 
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             file_config = json.load(f)
 
         # Handle new config format with profiles
@@ -187,6 +258,11 @@ class MultiProviderAuth:
             # Old format for backward compatibility
             profile_config = file_config.get(self.profile, {})
 
+        # SSO-disabled profiles skip OIDC validation entirely — credentials come
+        # from the ambient chain (AWS Identity Center, instance profile, env vars).
+        if not profile_config.get("sso_enabled", True):
+            return profile_config
+
         # Auto-detect federation type based on configuration
         self._detect_federation_type(profile_config)
 
@@ -207,6 +283,16 @@ class MultiProviderAuth:
         profile_config.setdefault(
             "max_session_duration", 43200 if profile_config.get("federation_type") == "direct" else 28800
         )
+
+        # Load client secret from OS keyring if configured for secret-based confidential client.
+        # The secret is never written to config.json; it lives only in the keyring.
+        if profile_config.get("azure_auth_mode") == "secret":
+            try:
+                secret = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-client-secret")
+                if secret:
+                    profile_config["client_secret"] = secret
+            except Exception as e:
+                self._debug_print(f"Warning: could not read client secret from keyring: {e}")
 
         return profile_config
 
@@ -232,9 +318,9 @@ class MultiProviderAuth:
         """Determine provider type from domain"""
         domain = self.config["provider_domain"].lower()
 
-        # If provider_type is explicitly set and it's NOT 'auto', use it
+        # If provider_type is explicitly set and is a known provider, use it
         provider_type = self.config.get("provider_type", "auto")
-        if provider_type != "auto":
+        if provider_type in PROVIDER_CONFIGS:
             return provider_type
 
         # Secure provider detection using proper URL parsing
@@ -265,7 +351,12 @@ class MultiProviderAuth:
 
             # Check for exact domain match or subdomain match
             # Using endswith with leading dot prevents bypass attacks
-            if hostname_lower.endswith(".okta.com") or hostname_lower == "okta.com":
+            okta_domains = (".okta.com", ".oktapreview.com", ".okta-emea.com")
+            if hostname_lower.endswith(okta_domains) or hostname_lower in (
+                "okta.com",
+                "oktapreview.com",
+                "okta-emea.com",
+            ):
                 return "okta"
             elif hostname_lower.endswith(".auth0.com") or hostname_lower == "auth0.com":
                 return "auth0"
@@ -276,11 +367,16 @@ class MultiProviderAuth:
             elif hostname_lower.endswith(".amazoncognito.com") or hostname_lower == "amazoncognito.com":
                 # Cognito User Pool domain format: my-domain.auth.{region}.amazoncognito.com
                 return "cognito"
+            elif hostname_lower.startswith("cognito-idp.") and ".amazonaws.com" in hostname_lower:
+                # Cognito User Pool IdP format: cognito-idp.{region}.amazonaws.com
+                return "cognito"
+            elif hostname_lower == "accounts.google.com":
+                return "google"
             else:
                 # Fail with clear error for unknown providers
                 raise ValueError(
                     f"Unable to auto-detect provider type for domain '{domain}'. "
-                    f"Known providers: Okta, Auth0, Microsoft/Azure, AWS Cognito User Pool. "
+                    f"Known providers: Okta, Auth0, Microsoft/Azure, AWS Cognito User Pool, Google. "
                     f"Please check your provider domain configuration."
                 )
         except ValueError:
@@ -471,7 +567,39 @@ class MultiProviderAuth:
 
         # Clear monitoring token from keyring
         try:
-            if keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring"):
+            if platform.system() == "Windows":
+                # Chunked format: overwrite every chunk and reset the meta so the
+                # real token is not left recoverable. Also clear any legacy entry.
+                cleared_monitoring = False
+                # Reset meta to count:0 BEFORE scrubbing chunks so an interrupted clear
+                # leaves the read gated to None rather than reassembling stale chunks.
+                meta_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring-meta")
+                if meta_json:
+                    keyring.set_password(
+                        "claude-code-with-bedrock",
+                        f"{self.profile}-monitoring-meta",
+                        json.dumps({"count": 0, "expires": 0, "email": "", "profile": self.profile}),
+                    )
+                    cleared_monitoring = True
+                # Scan actual chunk entries from index 1 rather than trusting
+                # meta.count: this also scrubs orphans from a larger prior token and
+                # a meta-less set left by a crash mid-save.
+                idx = 1
+                while keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring-{idx}") is not None:
+                    keyring.set_password("claude-code-with-bedrock", f"{self.profile}-monitoring-{idx}", "EXPIRED")  # nosec B105
+                    cleared_monitoring = True
+                    idx += 1
+                # Legacy single-entry monitoring token (pre-chunk installs)
+                if keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring"):
+                    keyring.set_password(
+                        "claude-code-with-bedrock",
+                        f"{self.profile}-monitoring",
+                        json.dumps({"token": "EXPIRED", "expires": 0, "email": "", "profile": self.profile}),
+                    )
+                    cleared_monitoring = True
+                if cleared_monitoring:
+                    cleared_items.append("keyring monitoring token")
+            elif keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring"):
                 # Replace with expired dummy token
                 expired_token = json.dumps(
                     {"token": "EXPIRED", "expires": 0, "email": "", "profile": self.profile}  # Expired timestamp
@@ -481,23 +609,24 @@ class MultiProviderAuth:
         except Exception as e:
             self._debug_print(f"Could not clear keyring monitoring token: {e}")
 
-        # Clear credentials file (for session storage mode)
-        try:
-            credentials_path = Path.home() / ".aws" / "credentials"
-            if credentials_path.exists():
-                # Replace with expired dummy credentials instead of deleting
-                # This preserves the file for other profiles
-                expired_creds = {
-                    "Version": 1,
-                    "AccessKeyId": "EXPIRED",
-                    "SecretAccessKey": "EXPIRED",
-                    "SessionToken": "EXPIRED",
-                    "Expiration": "2000-01-01T00:00:00Z",
-                }
-                self.save_to_credentials_file(expired_creds, self.profile)
-                cleared_items.append("credentials file")
-        except Exception as e:
-            self._debug_print(f"Could not clear credentials file: {e}")
+        # Clear credentials file (for session storage mode only).
+        # Writing an EXPIRED stanza in keyring mode would shadow the profile's
+        # credential_process entry in ~/.aws/config (shared-credentials-file
+        # resolves before credential_process in the boto3 credential chain),
+        # which breaks Cowork Desktop's inferenceBedrockProfile lookup with
+        # a 403 InvalidClientTokenId.
+        if self.credential_storage == "session":
+            try:
+                # DELETE the section rather than writing an "EXPIRED" placeholder.
+                # A static block outranks credential_process in the AWS SDK profile
+                # chain, so a lingering placeholder — once #797 routes writes into
+                # the SDK-read relocated file — would permanently shadow
+                # credential_process. Removing the section lets the SDK fall through
+                # and re-invoke it (parity with the Go binary, #767/#768).
+                if self.remove_from_credentials_file(self.profile):
+                    cleared_items.append("credentials file")
+            except Exception as e:
+                self._debug_print(f"Could not clear credentials file: {e}")
 
         # Clear monitoring token from session directory
         session_dir = Path.home() / ".claude-code-session"
@@ -513,9 +642,163 @@ class MultiProviderAuth:
                 if not any(session_dir.iterdir()):
                     session_dir.rmdir()
             except Exception:
-                pass
+                pass  # nosec B110
 
         return cleared_items
+
+    def _clear_sts_credentials(self):
+        """Clear only STS credentials cache, preserving monitoring token for silent refresh."""
+        try:
+            if self.credential_storage == "keyring":
+                if platform.system() == "Windows":
+                    for entry in [
+                        f"{self.profile}-keys",
+                        f"{self.profile}-token1",
+                        f"{self.profile}-token2",
+                        f"{self.profile}-meta",
+                    ]:
+                        if keyring.get_password("claude-code-with-bedrock", entry):
+                            if "keys" in entry:
+                                expired_data = json.dumps({"AccessKeyId": "EXPIRED", "SecretAccessKey": "EXPIRED"})
+                            elif "meta" in entry:
+                                expired_data = json.dumps({"Version": 1, "Expiration": "2000-01-01T00:00:00Z"})
+                            else:
+                                expired_data = "EXPIRED"
+                            keyring.set_password("claude-code-with-bedrock", entry, expired_data)
+                else:
+                    if keyring.get_password("claude-code-with-bedrock", f"{self.profile}-credentials"):
+                        expired_credential = json.dumps(
+                            {
+                                "Version": 1,
+                                "AccessKeyId": "EXPIRED",
+                                "SecretAccessKey": "EXPIRED",
+                                "SessionToken": "EXPIRED",
+                                "Expiration": "2000-01-01T00:00:00Z",
+                            }
+                        )
+                        keyring.set_password(
+                            "claude-code-with-bedrock", f"{self.profile}-credentials", expired_credential
+                        )
+            # Clear session file credentials (but NOT monitoring token file)
+            session_dir = Path.home() / ".claude-code-session"
+            creds_file = session_dir / f"{self.profile}-credentials.json"
+            if creds_file.exists():
+                creds_file.unlink()
+
+            # For session storage mode, also clear the AWS shared credentials file.
+            # DELETE the section (don't write an "EXPIRED" placeholder): a static
+            # block outranks credential_process in the AWS SDK profile chain, so a
+            # lingering placeholder in the SDK-read file would shadow it permanently
+            # (#797). Removing it lets the SDK fall through (parity with Go #767/#768).
+            if self.credential_storage == "session":
+                self.remove_from_credentials_file(self.profile)
+
+            self._debug_print("Cleared STS credentials (monitoring token preserved)")
+        except Exception as e:
+            self._debug_print(f"Could not clear STS credentials: {e}")
+
+    # Per-entry chunk size for the Windows monitoring-token split. Windows
+    # Credential Manager caps a single entry at CRED_MAX_CREDENTIAL_BLOB_SIZE
+    # (5*512 = 2560 bytes), and the keyring backend stores values as UTF-16LE
+    # (2 bytes/char), so the practical limit is ~1280 chars. A real Azure
+    # id_token (~1.3KB) exceeds this, so it must be split. 1000 leaves headroom.
+    _MONITORING_CHUNK_SIZE = 1000
+
+    def _save_monitoring_keyring_windows(self, token_data):
+        """Persist the monitoring token to Windows keyring as N size-bounded chunks.
+
+        A single Credential Manager entry cannot hold a full id_token (see
+        _MONITORING_CHUNK_SIZE), so the token string is split across
+        {profile}-monitoring-1..N entries with a {profile}-monitoring-meta entry
+        holding the chunk count plus small fields (expires/email/profile) that
+        callers need without reassembling the token.
+        """
+        token = token_data["token"]
+        size = self._MONITORING_CHUNK_SIZE
+        chunks = [token[i : i + size] for i in range(0, len(token), size)] or [""]
+
+        written = []
+        try:
+            for idx, chunk in enumerate(chunks, start=1):
+                entry = f"{self.profile}-monitoring-{idx}"
+                keyring.set_password("claude-code-with-bedrock", entry, chunk)
+                written.append(entry)
+            keyring.set_password(
+                "claude-code-with-bedrock",
+                f"{self.profile}-monitoring-meta",
+                json.dumps(
+                    {
+                        "count": len(chunks),
+                        "expires": token_data.get("expires", 0),
+                        "email": token_data.get("email", ""),
+                        "profile": token_data.get("profile", self.profile),
+                    }
+                ),
+            )
+        except Exception:
+            # Roll back any partial write so a later read can't reassemble a
+            # truncated token (the all-or-nothing read guard also covers this).
+            for entry in written:
+                try:
+                    keyring.delete_password("claude-code-with-bedrock", entry)
+                except Exception:
+                    pass  # nosec B110
+            raise
+
+        # Purge orphaned higher-index chunks left by a previous, larger token so no
+        # plaintext tail survives a shrink. Chunks are written contiguously 1..N, so
+        # scanning until the first gap is safe.
+        try:
+            idx = len(chunks) + 1
+            while keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring-{idx}") is not None:
+                keyring.delete_password("claude-code-with-bedrock", f"{self.profile}-monitoring-{idx}")
+                idx += 1
+        except Exception:
+            pass  # nosec B110
+
+        # Remove a legacy single-entry monitoring token so stale data can't shadow
+        # the chunked entries on read.
+        try:
+            if keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring"):
+                keyring.delete_password("claude-code-with-bedrock", f"{self.profile}-monitoring")
+        except Exception:
+            pass  # nosec B110
+
+    def _read_monitoring_keyring_windows(self):
+        """Reassemble the monitoring token from Windows keyring chunks.
+
+        Returns the token_data dict, or None if no valid chunk set is present.
+        Falls back to a legacy single {profile}-monitoring entry for installs
+        that predate the chunked format.
+        """
+        meta_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring-meta")
+        if not meta_json:
+            # Backward compatibility: try the legacy single-entry format.
+            legacy = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring")
+            if not legacy:
+                return None
+            return json.loads(legacy)
+
+        meta = json.loads(meta_json)
+        count = meta.get("count", 0)
+        if not count:
+            return None
+
+        chunks = []
+        for idx in range(1, count + 1):
+            chunk = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring-{idx}")
+            # All-or-nothing guard: a missing chunk means an incomplete/partial
+            # write; never return a truncated token.
+            if chunk is None:
+                return None
+            chunks.append(chunk)
+
+        return {
+            "token": "".join(chunks),
+            "expires": meta.get("expires", 0),
+            "email": meta.get("email", ""),
+            "profile": meta.get("profile", self.profile),
+        }
 
     def save_monitoring_token(self, id_token, token_claims):
         """Save ID token for monitoring authentication"""
@@ -529,8 +812,17 @@ class MultiProviderAuth:
             }
 
             if self.credential_storage == "keyring":
-                # Store monitoring token in keyring
-                keyring.set_password("claude-code-with-bedrock", f"{self.profile}-monitoring", json.dumps(token_data))
+                if platform.system() == "Windows":
+                    # Windows Credential Manager rejects a full id_token in one
+                    # entry (~1280 char limit); split into chunks. See
+                    # _save_monitoring_keyring_windows.
+                    self._save_monitoring_keyring_windows(token_data)
+                else:
+                    # macOS Keychain / Secret Service have no small per-entry
+                    # limit; store as a single entry.
+                    keyring.set_password(
+                        "claude-code-with-bedrock", f"{self.profile}-monitoring", json.dumps(token_data)
+                    )
             else:
                 # Save to session directory alongside credentials
                 session_dir = Path.home() / ".claude-code-session"
@@ -539,7 +831,7 @@ class MultiProviderAuth:
                 # Use simple session file per profile
                 token_file = session_dir / f"{self.profile}-monitoring.json"
 
-                with open(token_file, "w") as f:
+                with open(token_file, "w", encoding="utf-8") as f:
                     json.dump(token_data, f)
                 token_file.chmod(0o600)
 
@@ -551,6 +843,44 @@ class MultiProviderAuth:
             # Non-fatal error - monitoring is optional
             self._debug_print(f"Warning: Could not save monitoring token: {e}")
 
+    def _load_monitoring_token_data(self):
+        """Load the raw monitoring-token blob from configured storage, or None.
+
+        Returns the parsed dict (with "token"/"expires") WITHOUT applying the
+        expiry check, so callers can tell "absent" apart from "present but
+        expired". Does not consult CLAUDE_CODE_MONITORING_TOKEN (that path
+        carries no expiry metadata).
+        """
+        try:
+            if self.credential_storage == "keyring":
+                if platform.system() == "Windows":
+                    # Reassemble from chunked entries (with legacy fallback).
+                    token_data = self._read_monitoring_keyring_windows()
+                    if not token_data:
+                        return None
+                else:
+                    # Retrieve from keyring (single entry on macOS/Linux)
+                    token_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring")
+
+                    if not token_json:
+                        return None
+
+                    token_data = json.loads(token_json)
+            else:
+                # Check session file
+                session_dir = Path.home() / ".claude-code-session"
+                token_file = session_dir / f"{self.profile}-monitoring.json"
+
+                if not token_file.exists():
+                    return None
+
+                with open(token_file, encoding="utf-8") as f:
+                    token_data = json.load(f)
+
+            return token_data
+        except Exception:
+            return None
+
     def get_monitoring_token(self):
         """Retrieve valid monitoring token from configured storage"""
         try:
@@ -561,31 +891,16 @@ class MultiProviderAuth:
             if env_token:
                 return env_token
 
-            if self.credential_storage == "keyring":
-                # Retrieve from keyring
-                token_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring")
-
-                if not token_json:
-                    return None
-
-                token_data = json.loads(token_json)
-            else:
-                # Check session file
-                session_dir = Path.home() / ".claude-code-session"
-                token_file = session_dir / f"{self.profile}-monitoring.json"
-
-                if not token_file.exists():
-                    return None
-
-                with open(token_file) as f:
-                    token_data = json.load(f)
+            token_data = self._load_monitoring_token_data()
+            if not token_data:
+                return None
 
             # Check expiration
             exp_time = token_data.get("expires", 0)
             now = int(datetime.now(timezone.utc).timestamp())
 
-            # Return token if it expires in more than 10 minutes
-            if exp_time - now > 600:
+            # Return token if it expires in more than 60 seconds
+            if exp_time - now > 60:
                 token = token_data["token"]
                 # Set in environment for this session
                 os.environ["CLAUDE_CODE_MONITORING_TOKEN"] = token
@@ -595,8 +910,61 @@ class MultiProviderAuth:
         except Exception:
             return None
 
+    def get_mcp_auth_header(self):
+        """Return the MCP Authorization header dict from the cached id_token, or None.
+
+        {"Authorization": "Bearer <id_token>"} for the AgentCore web-search MCP
+        headersHelper. Reads only the cached token via get_monitoring_token() —
+        never opens a browser. Returns None when no valid token is available so
+        the caller fails cleanly (no hang, no prompt).
+
+        NOTE (Go/Python asymmetry): the Go credential-process silently re-mints
+        an expired id_token via a browserless refresh_token exchange
+        (refreshIDTokenOnly) before giving up. The Python provider has no
+        refresh_token store, so it cannot do that here — a present-but-expired
+        token surfaces as None. We emit a one-line stderr hint distinguishing
+        "expired" from "never authenticated" so the failure is diagnosable, then
+        rely on the next full credential-process run (which Claude Code invokes
+        routinely) to re-mint and re-cache the token. Full silent-refresh parity
+        is a larger cross-cutting change tracked separately.
+        """
+        token = self.get_monitoring_token()
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+
+        # Distinguish expired-but-present from absent for a useful diagnostic.
+        token_data = self._load_monitoring_token_data()
+        if token_data and token_data.get("token"):
+            print(
+                f"Note: cached token for profile '{self.profile}' is expired; "
+                "re-run the credential process to refresh it.",
+                file=sys.stderr,
+            )
+        return None
+
+    @staticmethod
+    def _credentials_file_path():
+        """Return the AWS shared credentials file path this provider read/writes.
+
+        Honors AWS_SHARED_CREDENTIALS_FILE so we target the same file the primary
+        consumer resolves credentials from; otherwise a relocated file (e.g. via
+        MDM) would leave the consumer reading one file while this provider
+        writes/clears another, permanently shadowing credential_process (parity
+        with the Go binary; #797).
+
+        Resolution is raw (no ~ or $VAR expansion), matching the Go/JS SDK
+        shared-config loaders (the JS SDK is Claude Code's consumer). boto3 and
+        the AWS CLI additionally expand ~ and $VAR, so those forms are unsupported
+        here — use an absolute path. Scope is AWS_SHARED_CREDENTIALS_FILE only —
+        NOT AWS_CONFIG_FILE, which points at ~/.aws/config (profile/SSO settings).
+        """
+        env_path = os.environ.get("AWS_SHARED_CREDENTIALS_FILE")
+        if env_path:
+            return Path(env_path)
+        return Path.home() / ".aws" / "credentials"
+
     def save_to_credentials_file(self, credentials, profile="ClaudeCode"):
-        """Save credentials to ~/.aws/credentials file
+        """Save credentials to the AWS shared credentials file
 
         Args:
             credentials: Dict with AccessKeyId, SecretAccessKey, SessionToken, Expiration
@@ -605,7 +973,7 @@ class MultiProviderAuth:
         import tempfile
         from configparser import ConfigParser
 
-        credentials_path = Path.home() / ".aws" / "credentials"
+        credentials_path = self._credentials_file_path()
 
         # Create ~/.aws directory if it doesn't exist
         credentials_path.parent.mkdir(parents=True, exist_ok=True)
@@ -653,13 +1021,13 @@ class MultiProviderAuth:
                 try:
                     os.unlink(temp_path)
                 except Exception:
-                    pass
+                    pass  # nosec B110
                 raise
         except Exception as e:
             raise Exception(f"Failed to save credentials to file: {str(e)}") from e
 
     def read_from_credentials_file(self, profile="ClaudeCode"):
-        """Read credentials from ~/.aws/credentials file
+        """Read credentials from the AWS shared credentials file
 
         Args:
             profile: Profile name to read from credentials file
@@ -669,7 +1037,7 @@ class MultiProviderAuth:
         """
         from configparser import ConfigParser
 
-        credentials_path = Path.home() / ".aws" / "credentials"
+        credentials_path = self._credentials_file_path()
 
         if not credentials_path.exists():
             return None
@@ -709,6 +1077,61 @@ class MultiProviderAuth:
             self._debug_print(f"Error reading credentials from file: {e}")
             return None
 
+    def remove_from_credentials_file(self, profile="ClaudeCode"):
+        """Delete a profile section from the AWS shared credentials file.
+
+        Parity with the Go binary's RemoveFromCredentialsFile (#767/#768): the
+        clear/recovery path must DELETE the section, not overwrite it with an
+        "EXPIRED" static placeholder. A static block outranks credential_process
+        in the AWS SDK profile chain, so a lingering placeholder (once #797
+        routed writes into the SDK-read relocated file) would permanently shadow
+        credential_process — the SDK must instead fall through and re-invoke it.
+
+        Preserves unrelated profiles. Uses an atomic temp-write + replace so a
+        crash mid-write can't corrupt the file. No-op (returns False) if the file
+        or section is absent.
+
+        Returns True if the section was removed, False otherwise.
+        """
+        import os as _os
+        import tempfile
+        from configparser import ConfigParser
+
+        credentials_path = self._credentials_file_path()
+        if not credentials_path.exists():
+            return False
+
+        try:
+            # Disable inline comment characters so keys like 'x-expiration' survive.
+            config = ConfigParser(inline_comment_prefixes=())
+            config.read(credentials_path)
+
+            if profile not in config:
+                return False
+
+            config.remove_section(profile)
+
+            # Atomic replace: write to a temp file in the same dir, then os.replace.
+            fd, tmp_path = tempfile.mkstemp(dir=str(credentials_path.parent), prefix=".credentials-")
+            try:
+                with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                    config.write(f)
+                # Match save_to_credentials_file and the Go binary: explicit 0600
+                # (mkstemp already defaults to 0600, but be explicit for parity).
+                _os.chmod(tmp_path, 0o600)
+                _os.replace(tmp_path, str(credentials_path))
+            except Exception:
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+            return True
+
+        except Exception as e:
+            self._debug_print(f"Error removing credentials from file: {e}")
+            return False
+
     def check_credentials_file_expiration(self, profile="ClaudeCode"):
         """Check if credentials in file are expired
 
@@ -740,8 +1163,87 @@ class MultiProviderAuth:
             self._debug_print(f"Error parsing expiration: {e}")
             return True  # Assume expired on parse error
 
-    def authenticate_oidc(self):
-        """Perform OIDC authentication with PKCE"""
+    def _build_client_assertion(self, token_url: str) -> str:
+        """Build a signed JWT client assertion for certificate-based confidential client auth.
+
+        Used by Azure AD / Entra ID when 'Allow public client flows' is disabled.
+        Follows the Microsoft identity platform certificate credentials specification:
+        https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials
+
+        Args:
+            token_url: The token endpoint URL, used as the JWT audience.
+
+        Returns:
+            A signed JWT string to be sent as client_assertion.
+        """
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+
+        # Env vars take precedence over config.json so paths stay portable across
+        # machines (self-install and admin-push scenarios).  This follows the
+        # Azure SDK convention for AZURE_CLIENT_CERTIFICATE_PATH.
+        cert_path = Path(
+            os.environ.get("AZURE_CLIENT_CERTIFICATE_PATH") or self.config["client_certificate_path"]
+        ).expanduser()
+        key_path = Path(
+            os.environ.get("AZURE_CLIENT_CERTIFICATE_KEY_PATH") or self.config["client_certificate_key_path"]
+        ).expanduser()
+
+        if not cert_path.exists():
+            raise FileNotFoundError(
+                f"Certificate file not found: {cert_path}\n"
+                "Set the AZURE_CLIENT_CERTIFICATE_PATH environment variable to the correct path, "
+                "or update 'client_certificate_path' in config.json."
+            )
+        if not key_path.exists():
+            raise FileNotFoundError(
+                f"Private key file not found: {key_path}\n"
+                "Set the AZURE_CLIENT_CERTIFICATE_KEY_PATH environment variable to the correct path, "
+                "or update 'client_certificate_key_path' in config.json."
+            )
+
+        cert_pem = cert_path.read_bytes()
+        key_pem = key_path.read_bytes()
+
+        cert = x509.load_pem_x509_certificate(cert_pem)
+        private_key = serialization.load_pem_private_key(key_pem, password=None)
+
+        # SHA-256 thumbprint of the DER-encoded certificate (x5t#S256 header)
+        # Per Microsoft Entra ID recommendation: https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials
+        thumbprint = cert.fingerprint(hashes.SHA256())
+        x5t_s256 = base64.urlsafe_b64encode(thumbprint).rstrip(b"=").decode()
+
+        now = int(time.time())
+        payload = {
+            "aud": token_url,
+            "iss": self.config["client_id"],
+            "sub": self.config["client_id"],
+            "jti": secrets.token_urlsafe(16),
+            "nbf": now,
+            "iat": now,
+            "exp": now + 300,  # 5-minute lifetime
+        }
+
+        # PyJWT encodes using the private key; headers must include x5t#S256
+        token = jwt.encode(
+            payload,
+            private_key,
+            algorithm="PS256",
+            headers={"x5t#S256": x5t_s256},
+        )
+        return token
+
+    def authenticate_oidc(self, lock_socket=None):
+        """Perform OIDC authentication with PKCE.
+
+        Args:
+            lock_socket: An optional socket already bound to the redirect port by
+                the caller's lock check. Reusing it keeps the port continuously
+                held from the lock check through the callback, closing the TOCTOU
+                window where a concurrent credential-process could bind the freed
+                port and open a second browser. If None, a fresh server socket is
+                bound here (legacy behavior).
+        """
         state = secrets.token_urlsafe(16)
         nonce = secrets.token_urlsafe(16)
 
@@ -790,13 +1292,32 @@ class MultiProviderAuth:
         # Add provider-specific parameters
         if self.provider_type == "azure":
             auth_params["response_mode"] = "query"
-            auth_params["prompt"] = "select_account"
+            prompt = self.config.get("oidc_prompt", "select_account")
+            if prompt:
+                auth_params["prompt"] = prompt
 
-        auth_url = f"{base_url}{self.provider_config['authorize_endpoint']}?" + urlencode(auth_params)
+        # For generic OIDC, the profile carries full endpoint URLs since path layout varies by IdP.
+        # Other providers use the hardcoded paths in PROVIDER_CONFIGS appended to the base URL.
+        configured_authorize = self.config.get("oidc_authorization_endpoint")
+        if configured_authorize:
+            authorize_url = configured_authorize
+        else:
+            authorize_url = f"{base_url}{self.provider_config['authorize_endpoint']}"
+        auth_url = f"{authorize_url}?" + urlencode(auth_params)
 
         # Setup callback server
         auth_result = {"code": None, "error": None}
-        server = HTTPServer(("127.0.0.1", self.redirect_port), self._create_callback_handler(state, auth_result))
+        handler = self._create_callback_handler(state, auth_result)
+        if lock_socket is not None:
+            # Reuse the caller's already-bound lock socket so the port is never
+            # released between the lock check and the callback (no TOCTOU gap).
+            server = HTTPServer(("127.0.0.1", self.redirect_port), handler, bind_and_activate=False)
+            # Close the default socket created by TCPServer.__init__ to avoid fd leak
+            server.socket.close()
+            server.socket = lock_socket
+            lock_socket.listen(5)
+        else:
+            server = HTTPServer(("127.0.0.1", self.redirect_port), handler)
 
         # Start server in background
         server_thread = threading.Thread(target=server.handle_request)
@@ -826,8 +1347,35 @@ class MultiProviderAuth:
             "code_verifier": code_verifier,
         }
 
-        # Build token endpoint URL
-        token_url = f"{base_url}{self.provider_config['token_endpoint']}"
+        # Build token endpoint URL (configured value wins for generic OIDC)
+        configured_token = self.config.get("oidc_token_endpoint")
+        token_endpoint = self.provider_config["token_endpoint"]
+        if configured_token:
+            token_url = configured_token
+        elif token_endpoint.startswith("https://"):
+            token_url = token_endpoint
+        else:
+            token_url = f"{base_url}{token_endpoint}"
+
+        # Confidential client: inject client_secret or certificate assertion
+        if self.config.get("client_certificate_path") and self.config.get("client_certificate_key_path"):
+            token_data["client_assertion_type"] = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+            token_data["client_assertion"] = self._build_client_assertion(token_url)
+        elif self.config.get("client_secret"):
+            token_data["client_secret"] = self.config["client_secret"]
+        else:
+            azure_auth_mode = self.config.get("azure_auth_mode")
+            if azure_auth_mode == "certificate":
+                raise ValueError(
+                    "azure_auth_mode is 'certificate' but no certificate paths are configured. "
+                    "Set AZURE_CLIENT_CERTIFICATE_PATH and AZURE_CLIENT_CERTIFICATE_KEY_PATH, "
+                    "or update 'client_certificate_path' and 'client_certificate_key_path' in config.json."
+                )
+            if azure_auth_mode == "secret":
+                raise ValueError(
+                    "azure_auth_mode is 'secret' but no client secret is stored. "
+                    f"Run: credential-process --set-client-secret --profile {self.profile}"
+                )
 
         token_response = requests.post(
             token_url,
@@ -890,7 +1438,7 @@ class MultiProviderAuth:
 
             def _send_response(self, code, message):
                 self.send_response(code)
-                self.send_header("Content-type", "text/html")
+                self.send_header("Content-type", "text/html; charset=utf-8")
                 self.end_headers()
                 html = f"""
                 <html>
@@ -942,45 +1490,31 @@ class MultiProviderAuth:
             # Create STS client
             sts_client = boto3.client("sts", region_name=self.config["aws_region"])
 
-            # Prepare session tags from token claims
-            session_tags = []
-
-            # Map common claims to session tags
-            tag_mappings = {
-                "email": "UserEmail",
-                "sub": "UserId",
-                "preferred_username": "UserName",
-                "name": "UserName",  # Fallback for providers that use 'name' instead
-            }
-
-            for claim_key, tag_key in tag_mappings.items():
-                if claim_key in token_claims:
-                    # Session tag values have a 256 character limit
-                    tag_value = str(token_claims[claim_key])[:256]
-                    session_tags.append({"Key": tag_key, "Value": tag_value})
-
             # Generate session name from user identifier
-            # AWS RoleSessionName regex: [\w+=,.@-]*
+            # AWS RoleSessionName regex: [\w+=,.@-]*, max 64 chars
             # Auth0 often uses pipe-delimited format in sub claims (e.g., auth0|12345)
             # Sanitize to replace invalid characters with hyphens
             session_name = "claude-code"
-            if "sub" in token_claims:
-                # Use first 32 chars of sub for uniqueness, sanitized for AWS
+            if "email" in token_claims:
+                # Use full email for human-readable CUR cost attribution.
+                # The principal ARN (assumed-role/RoleName/alice@acme.com) appears
+                # in CUR line_item_iam_principal, enabling per-user cost visibility
+                # without requiring session tags.
+                session_name = re.sub(r"[^\w+=,.@-]", "-", str(token_claims["email"]))[:64]
+            elif "sub" in token_claims:
+                # Fallback to sub when email is not available (e.g. some Entra ID configs)
                 sub_sanitized = re.sub(r"[^\w+=,.@-]", "-", str(token_claims["sub"])[:32])
                 session_name = f"claude-code-{sub_sanitized}"
-            elif "email" in token_claims:
-                # Use email username part, sanitized
-                email_part = token_claims["email"].split("@")[0][:32]
-                email_sanitized = re.sub(r"[^\w+=,.@-]", "-", email_part)
-                session_name = f"claude-code-{email_sanitized}"
 
             self._debug_print(f"Assuming role: {federated_role_arn}")
             self._debug_print(f"Session name: {session_name}")
-            self._debug_print(f"Session tags: {session_tags}")
 
             # Call AssumeRoleWithWebIdentity
-            # Note: AssumeRoleWithWebIdentity doesn't support Tags parameter directly
-            # Session tags must be passed via the token claims and configured in the trust policy
+            # Note: AssumeRoleWithWebIdentity does not support a Tags parameter.
+            # Session tags must be embedded in the JWT by the IdP as the
+            # https://aws.amazon.com/tags claim. Use the Cognito Identity Pool
+            # path (FederationType=cognito) for automatic tag mapping via
+            # PrincipalTags without IdP-side configuration.
             assume_role_params = {
                 "RoleArn": federated_role_arn,
                 "RoleSessionName": session_name,
@@ -1174,57 +1708,26 @@ class MultiProviderAuth:
                 ) from e
             raise Exception(f"Failed to get AWS credentials: {str(e)}") from None
 
-    def _wait_for_auth_completion(self, timeout=60):
-        """Wait for another process to complete authentication using port-based detection"""
-        start_time = time.time()
-
-        while time.time() - start_time < timeout:
-            # Check if port is still in use (another auth in progress)
-            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                test_socket.bind(("127.0.0.1", self.redirect_port))
-                test_socket.close()
-                # Port is free, auth must have completed or failed
-                # Check for cached credentials
-                cached = self.get_cached_credentials()
-                if cached:
-                    return cached
-                else:
-                    # Auth failed or was cancelled
-                    return None
-            except OSError as e:
-                if e.errno == errno.EADDRINUSE:
-                    # Port still in use, auth still in progress
-                    time.sleep(0.5)
-                else:
-                    # Other error
-                    raise
-            finally:
-                try:
-                    test_socket.close()
-                except Exception:
-                    pass
-
-        return None
-
     def authenticate_for_monitoring(self):
         """Authenticate specifically for monitoring token (no AWS credential output)"""
         try:
-            # Try to acquire port lock by testing if we can bind to it
-            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Try to acquire port lock by testing if we can bind to it.
+            # Keep the socket BOUND (don't close it) so the port is held
+            # continuously through authenticate_oidc — see run() for the rationale.
+            lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # SO_REUSEADDR lets a TIME_WAIT socket be rebound on POSIX (the macOS/Linux
+            # fix from review). On Windows it instead lets a SECOND ACTIVE listener bind
+            # the same port, which would defeat the inter-process port lock — guard it off.
+            if platform.system() != "Windows":
+                lock_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                test_socket.bind(("127.0.0.1", self.redirect_port))
-                test_socket.close()
-                # We got the port, we can proceed with authentication
+                lock_socket.bind(("127.0.0.1", self.redirect_port))
                 self._debug_print("Port available, proceeding with monitoring authentication")
             except OSError as e:
+                lock_socket.close()
                 if e.errno == errno.EADDRINUSE:
-                    # Port in use, another auth is in progress
                     self._debug_print("Another authentication is in progress, waiting...")
-                    test_socket.close()
 
-                    # Wait for the other process to complete
-                    # After waiting, check if we now have a monitoring token
                     self._wait_for_auth_completion()
                     token = self.get_monitoring_token()
                     if token:
@@ -1233,21 +1736,25 @@ class MultiProviderAuth:
                         self._debug_print("Authentication timeout or failed in another process")
                         return None
                 else:
-                    test_socket.close()
                     raise
 
-            # Authenticate with OIDC provider
-            self._debug_print(f"Authenticating with {self.provider_config['name']} for monitoring token...")
-            id_token, token_claims = self.authenticate_oidc()
+            # From here we own the port lock; ensure it is always released.
+            try:
+                # Authenticate with OIDC provider (reuse the bound lock socket).
+                self._debug_print(f"Authenticating with {self.provider_config['name']} for monitoring token...")
+                id_token, token_claims = self.authenticate_oidc(lock_socket=lock_socket)
+            finally:
+                try:
+                    lock_socket.close()
+                except Exception:
+                    pass  # nosec B110
 
-            # Get AWS credentials (we need them but won't output them)
-            self._debug_print("Exchanging token for AWS credentials...")
-            credentials = self.get_aws_credentials(id_token, token_claims)
-
-            # Cache credentials for future use
-            self.save_credentials(credentials)
-
-            # Save monitoring token
+            # Persist the monitoring token only. Deliberately NO AWS credential
+            # exchange here: this entrypoint serves OTEL attribution, and
+            # minting credentials on it would bypass quota enforcement (#761) —
+            # every credential-minting path must enforce quota first. A blocked
+            # user still gets a monitoring token so their telemetry stays
+            # attributed.
             self.save_monitoring_token(id_token, token_claims)
 
             # Return just the monitoring token
@@ -1304,7 +1811,7 @@ class MultiProviderAuth:
                 session_dir = Path.home() / ".claude-code-session"
                 timestamp_file = session_dir / f"{self.profile}-quota-check.json"
                 if timestamp_file.exists():
-                    with open(timestamp_file) as f:
+                    with open(timestamp_file, encoding="utf-8") as f:
                         data = json.load(f)
                         return datetime.fromisoformat(data["last_check"])
             return None
@@ -1322,7 +1829,7 @@ class MultiProviderAuth:
                 session_dir = Path.home() / ".claude-code-session"
                 session_dir.mkdir(parents=True, exist_ok=True)
                 timestamp_file = session_dir / f"{self.profile}-quota-check.json"
-                with open(timestamp_file, "w") as f:
+                with open(timestamp_file, "w", encoding="utf-8") as f:
                     json.dump({"last_check": now}, f)
                 timestamp_file.chmod(0o600)
             self._debug_print("Saved quota check timestamp")
@@ -1333,15 +1840,25 @@ class MultiProviderAuth:
         """Get token claims from cached monitoring token for quota re-check."""
         try:
             if self.credential_storage == "keyring":
-                token_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring")
-                if token_json:
-                    token_data = json.loads(token_json)
-                    return {"email": token_data.get("email", "")}
+                if platform.system() == "Windows":
+                    # Email lives in the meta entry; no need to reassemble chunks.
+                    meta_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring-meta")
+                    if meta_json:
+                        return {"email": json.loads(meta_json).get("email", "")}
+                    # Legacy single-entry fallback
+                    token_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring")
+                    if token_json:
+                        return {"email": json.loads(token_json).get("email", "")}
+                else:
+                    token_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-monitoring")
+                    if token_json:
+                        token_data = json.loads(token_json)
+                        return {"email": token_data.get("email", "")}
             else:
                 session_dir = Path.home() / ".claude-code-session"
                 token_file = session_dir / f"{self.profile}-monitoring.json"
                 if token_file.exists():
-                    with open(token_file) as f:
+                    with open(token_file, encoding="utf-8") as f:
                         token_data = json.load(f)
                         return {"email": token_data.get("email", "")}
             return None
@@ -1382,12 +1899,21 @@ class MultiProviderAuth:
 
         return list(set(groups))  # Remove duplicates
 
-    def _check_quota(self, token_claims: dict, id_token: str) -> dict:
+    def _check_quota(self, token_claims: dict, id_token: str = None, frozen_credentials=None) -> dict:
         """Check user quota via the quota check API.
 
+        Supports two auth modes:
+        - OIDC: sends JWT in Authorization header (API Gateway JWT Authorizer)
+        - IDC/IAM: sends SigV4-signed request (API Gateway IAM auth)
+
         Args:
-            token_claims: JWT token claims containing user info (for logging/fallback)
-            id_token: Raw JWT token to send in Authorization header for API Gateway validation
+            token_claims: JWT token claims containing user info (for logging/fallback).
+                          For IDC, may be empty — email is resolved from IAM ARN server-side.
+            id_token: Raw JWT token for OIDC path. None for IDC path.
+            frozen_credentials: Pre-resolved boto credentials for SigV4 signing.
+                               When provided, used directly instead of resolving from
+                               ambient chain. Fixes 403 when ambient creds differ from
+                               the profile's SSO credentials.
 
         Returns:
             Quota check result dict with 'allowed' key
@@ -1396,22 +1922,50 @@ class MultiProviderAuth:
         fail_mode = self.config.get("quota_fail_mode", "open")
         timeout = self.config.get("quota_check_timeout", 5)
 
-        email = token_claims.get("email")
-        if not email:
+        email = token_claims.get("email") if token_claims else None
+        if not email and not id_token:
+            # IDC path: email will be resolved server-side from IAM ARN
+            self._debug_print("IDC mode: email will be resolved from IAM ARN by quota Lambda")
+        elif not email:
             self._debug_print("No email in token claims, skipping quota check")
             return {"allowed": True, "reason": "no_email"}
 
-        groups = self._extract_groups(token_claims)
-        self._debug_print(f"Checking quota for {email} (groups: {groups})")
+        if email:
+            groups = self._extract_groups(token_claims)
+            self._debug_print(f"Checking quota for {email} (groups: {groups})")
+        else:
+            self._debug_print("Checking quota via IAM identity")
 
         try:
-            # Send JWT token in Authorization header for API Gateway JWT Authorizer validation
-            # The API extracts email/groups from validated JWT claims, not query params
-            response = requests.get(
-                f"{quota_api_endpoint}/check",
-                headers={"Authorization": f"Bearer {id_token}"},
-                timeout=timeout
-            )
+            if id_token:
+                # OIDC path: JWT in Authorization header
+                response = requests.get(
+                    f"{quota_api_endpoint}/check", headers={"Authorization": f"Bearer {id_token}"}, timeout=timeout
+                )
+            else:
+                # IDC/IAM path: SigV4-signed request using resolved credentials
+                import botocore.session
+                from botocore.auth import SigV4Auth
+                from botocore.awsrequest import AWSRequest
+                from botocore.credentials import Credentials
+
+                if frozen_credentials:
+                    # Use pre-resolved credentials (from passthrough/IDC path).
+                    # frozen_credentials is a ReadOnlyCredentials namedtuple;
+                    # wrap into botocore Credentials for SigV4Auth.
+                    credentials = Credentials(
+                        access_key=frozen_credentials.access_key,
+                        secret_key=frozen_credentials.secret_key,
+                        token=frozen_credentials.token,
+                    )
+                else:
+                    # Fallback: resolve from ambient chain (may differ from profile)
+                    session = botocore.session.get_session()
+                    credentials = session.get_credentials().get_frozen_credentials()
+                url = f"{quota_api_endpoint}/check"
+                request = AWSRequest(method="GET", url=url)
+                SigV4Auth(credentials, "execute-api", self.config.get("aws_region", "us-east-1")).add_auth(request)
+                response = requests.get(url, headers=dict(request.headers), timeout=timeout)
 
             if response.status_code == 200:
                 result = response.json()
@@ -1424,7 +1978,7 @@ class MultiProviderAuth:
                     return {
                         "allowed": False,
                         "reason": "jwt_invalid",
-                        "message": "Quota check authentication failed - invalid or expired token"
+                        "message": "Quota check authentication failed - invalid or expired token",
                     }
                 return {"allowed": True, "reason": "jwt_invalid"}
             else:
@@ -1434,18 +1988,14 @@ class MultiProviderAuth:
                     return {
                         "allowed": False,
                         "reason": "api_error",
-                        "message": f"Quota check failed with status {response.status_code}"
+                        "message": f"Quota check failed with status {response.status_code}",
                     }
                 return {"allowed": True, "reason": "api_error"}
 
         except requests.exceptions.Timeout:
             self._debug_print("Quota check timed out")
             if fail_mode == "closed":
-                return {
-                    "allowed": False,
-                    "reason": "timeout",
-                    "message": "Quota check timed out. Please try again."
-                }
+                return {"allowed": False, "reason": "timeout", "message": "Quota check timed out. Please try again."}
             return {"allowed": True, "reason": "timeout"}
 
         except requests.exceptions.RequestException as e:
@@ -1454,18 +2004,14 @@ class MultiProviderAuth:
                 return {
                     "allowed": False,
                     "reason": "connection_error",
-                    "message": f"Could not connect to quota service: {e}"
+                    "message": f"Could not connect to quota service: {e}",
                 }
             return {"allowed": True, "reason": "connection_error"}
 
         except Exception as e:
             self._debug_print(f"Quota check error: {e}")
             if fail_mode == "closed":
-                return {
-                    "allowed": False,
-                    "reason": "error",
-                    "message": f"Quota check failed: {e}"
-                }
+                return {"allowed": False, "reason": "error", "message": f"Quota check failed: {e}"}
             return {"allowed": True, "reason": "error"}
 
     def _handle_quota_blocked(self, quota_result: dict) -> int:
@@ -1491,9 +2037,15 @@ class MultiProviderAuth:
         if usage:
             print("Current Usage:", file=sys.stderr)
             if "monthly_tokens" in usage and "monthly_limit" in usage:
-                print(f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({usage.get('monthly_percent', 0):.1f}%)", file=sys.stderr)
+                print(
+                    f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({usage.get('monthly_percent', 0):.1f}%)",
+                    file=sys.stderr,
+                )
             if "daily_tokens" in usage and "daily_limit" in usage:
-                print(f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({usage.get('daily_percent', 0):.1f}%)", file=sys.stderr)
+                print(
+                    f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({usage.get('daily_percent', 0):.1f}%)",
+                    file=sys.stderr,
+                )
 
         if policy:
             print(f"\nPolicy: {policy.get('type', 'unknown')}:{policy.get('identifier', 'unknown')}", file=sys.stderr)
@@ -1503,6 +2055,10 @@ class MultiProviderAuth:
 
         # Show browser notification
         self._show_quota_browser_notification(quota_result, is_blocked=True)
+
+        # Clear cached STS credentials so next call goes through refresh path
+        # which always re-checks quota (no interval bypass)
+        self._clear_sts_credentials()
 
         return 1
 
@@ -1529,11 +2085,11 @@ class MultiProviderAuth:
 
             def format_tokens(n):
                 if n >= 1_000_000_000:
-                    return f"{n/1_000_000_000:.1f}B"
+                    return f"{n / 1_000_000_000:.1f}B"
                 elif n >= 1_000_000:
-                    return f"{n/1_000_000:.1f}M"
+                    return f"{n / 1_000_000:.1f}M"
                 elif n >= 1_000:
-                    return f"{n/1_000:.1f}K"
+                    return f"{n / 1_000:.1f}K"
                 return str(int(n))
 
             # Determine status styling
@@ -1656,15 +2212,21 @@ class MultiProviderAuth:
             <div class="usage-section">
                 <div class="usage-label">
                     <span>Monthly Usage</span>
-                    <span class="usage-value">{format_tokens(monthly_tokens)} / {format_tokens(monthly_limit)} ({monthly_percent:.1f}%)</span>
+                    <span class="usage-value">{format_tokens(monthly_tokens)} / {format_tokens(monthly_limit)} ({
+                monthly_percent:.1f}%)</span>
                 </div>
                 <div class="progress-bar">
-                    <div class="progress-fill" style="width: {min(monthly_percent, 100)}%; background: {monthly_bar_color};">
+                    <div class="progress-fill" style="width: {min(monthly_percent, 100)}%; background: {
+                monthly_bar_color
+            };">
                         {monthly_percent:.0f}%
                     </div>
                 </div>
             </div>
-            {"" if not daily_limit else f'''
+            {
+                ""
+                if not daily_limit
+                else f'''
             <div class="usage-section">
                 <div class="usage-label">
                     <span>Daily Usage</span>
@@ -1676,9 +2238,18 @@ class MultiProviderAuth:
                     </div>
                 </div>
             </div>
-            '''}
+            '''
+            }
             <div class="message">
-                {html_module.escape(message) if message else ("Your access has been blocked due to quota limits." if is_blocked else "You're approaching your quota limit.")}
+                {
+                html_module.escape(message)
+                if message
+                else (
+                    "Your access has been blocked due to quota limits."
+                    if is_blocked
+                    else "You're approaching your quota limit."
+                )
+            }
                 {" Contact your administrator for assistance." if is_blocked else ""}
             </div>
         </div>
@@ -1696,7 +2267,7 @@ class MultiProviderAuth:
             class QuotaPageHandler(BaseHTTPRequestHandler):
                 def do_GET(self):
                     self.send_response(200)
-                    self.send_header("Content-type", "text/html")
+                    self.send_header("Content-type", "text/html; charset=utf-8")
                     self.end_headers()
                     self.wfile.write(html.encode())
                     page_served["done"] = True
@@ -1731,7 +2302,7 @@ class MultiProviderAuth:
         Args:
             quota_result: Result from quota check API
         """
-        usage = quota_result.get("usage", {})
+        usage = quota_result.get("usage") or {}
         monthly_percent = usage.get("monthly_percent", 0)
         daily_percent = usage.get("daily_percent", 0)
 
@@ -1746,9 +2317,15 @@ class MultiProviderAuth:
 
         if usage:
             if "monthly_tokens" in usage and "monthly_limit" in usage:
-                print(f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({monthly_percent:.1f}%)", file=sys.stderr)
+                print(
+                    f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({monthly_percent:.1f}%)",
+                    file=sys.stderr,
+                )
             if "daily_tokens" in usage and "daily_limit" in usage:
-                print(f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({daily_percent:.1f}%)", file=sys.stderr)
+                print(
+                    f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({daily_percent:.1f}%)",
+                    file=sys.stderr,
+                )
 
         print("=" * 60 + "\n", file=sys.stderr)
 
@@ -1759,8 +2336,102 @@ class MultiProviderAuth:
     # End Quota Check Methods
     # ===========================================
 
+    def _get_cached_token_for_silent_refresh(self):
+        """Return (id_token, token_claims) from the cached monitoring token, or (None, None).
+
+        Read-only: no STS exchange happens here so the caller can enforce
+        quota with the token BEFORE any credentials are minted.
+        """
+        try:
+            id_token = self.get_monitoring_token()
+            if not id_token:
+                self._debug_print("No valid cached id_token for silent refresh")
+                return None, None
+            token_claims = jwt.decode(id_token, options={"verify_signature": False})
+            return id_token, token_claims
+        except Exception as e:
+            self._debug_print(f"Could not load cached id_token for silent refresh: {e}")
+            return None, None
+
+    def _try_silent_refresh(self, id_token, token_claims):
+        """Exchange a quota-cleared cached id_token for AWS credentials and persist them.
+
+        Callers MUST run the quota check first — this method mints and caches
+        credentials, so calling it before quota clearance would hand an
+        over-quota user a full STS session.
+
+        Returns:
+            Credentials dict if successful, None otherwise (caller falls back to browser auth).
+        """
+        try:
+            self._debug_print("Found valid cached id_token, attempting silent credential refresh...")
+            credentials = self.get_aws_credentials(id_token, token_claims)
+            self.save_credentials(credentials)
+            self.save_monitoring_token(id_token, token_claims)
+            self._debug_print("Silent credential refresh succeeded")
+            return credentials
+        except Exception as e:
+            self._debug_print(f"Silent refresh failed, will require browser auth: {e}")
+            return None
+
+    def _run_passthrough(self):
+        """Emit credentials from the ambient AWS credential chain (Identity Center, env vars, instance profile).
+
+        Used when sso_enabled=false — no OIDC browser flow, just surface whatever
+        credentials boto3 already has resolved for the caller.
+
+        Note: Expiration is omitted because we cannot reliably determine the
+        actual expiry of ambient credentials. The AWS SDK will cache these
+        until they fail, at which point the user must re-authenticate
+        (e.g. 'aws sso login'). This matches the credential-process spec:
+        omitting Expiration means "credentials do not expire."
+        """
+        session = boto3.Session()
+        creds = session.get_credentials()
+        if creds is None:
+            print(
+                "Error: sso_enabled=false but no ambient AWS credentials found. Log in via 'aws sso login' first.",
+                file=sys.stderr,
+            )
+            return 1
+
+        frozen = creds.get_frozen_credentials()
+        if not frozen.access_key:
+            print(
+                "Error: ambient credentials resolved but access key is empty. "
+                "Check your AWS CLI configuration or run 'aws sso login'.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Quota enforcement (SigV4-signed — email resolved from IAM ARN server-side).
+        if self._should_check_quota():
+            self._debug_print("IDC/passthrough: performing SigV4 quota check")
+            quota_result = self._check_quota(token_claims={}, id_token=None, frozen_credentials=frozen)
+            if not quota_result.get("allowed", True):
+                reason = quota_result.get("reason", "quota exceeded")
+                message = quota_result.get("message", "Usage quota exceeded. Contact your administrator.")
+                print(f"Error: {message}", file=sys.stderr)
+                print(f"Reason: {reason}", file=sys.stderr)
+                return 1
+            self._save_quota_check_timestamp()
+
+        output = {
+            "Version": 1,
+            "AccessKeyId": frozen.access_key,
+            "SecretAccessKey": frozen.secret_key,
+        }
+        if frozen.token:
+            output["SessionToken"] = frozen.token
+
+        print(json.dumps(output))
+        return 0
+
     def run(self):
         """Main execution flow"""
+        if not getattr(self, "sso_enabled", True):
+            return self._run_passthrough()
+
         try:
             # Check cache first
             cached = self.get_cached_credentials()
@@ -1771,6 +2442,7 @@ class MultiProviderAuth:
                     id_token = self.get_monitoring_token()
                     token_claims = self._get_cached_token_claims()
                     if id_token and token_claims:
+                        # OIDC path: check with JWT
                         quota_result = self._check_quota(token_claims, id_token)
                         self._save_quota_check_timestamp()
                         if not quota_result.get("allowed", True):
@@ -1778,48 +2450,83 @@ class MultiProviderAuth:
                         else:
                             self._handle_quota_warning(quota_result)
                     else:
-                        self._debug_print("No cached token for quota re-check, skipping")
+                        # IDC/IAM path: check with SigV4 (no JWT needed)
+                        self._debug_print("No JWT token — using IAM identity for quota check")
+                        quota_result = self._check_quota({}, None)
+                        self._save_quota_check_timestamp()
+                        if not quota_result.get("allowed", True):
+                            return self._handle_quota_blocked(quota_result)
+                        else:
+                            self._handle_quota_warning(quota_result)
 
                 # Output cached credentials (intended behavior for AWS CLI)
                 print(json.dumps(cached))  # noqa: S105
                 return 0
 
-            # Try to acquire port lock by testing if we can bind to it
-            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Try to acquire port lock by testing if we can bind to it.
+            # Keep the socket BOUND (don't close it) so the port is held
+            # continuously through authenticate_oidc — closing it here would open
+            # a TOCTOU window for a concurrent credential-process to also auth.
+            lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # SO_REUSEADDR lets a TIME_WAIT socket be rebound on POSIX (the macOS/Linux
+            # fix from review). On Windows it instead lets a SECOND ACTIVE listener bind
+            # the same port, which would defeat the inter-process port lock — guard it off.
+            if platform.system() != "Windows":
+                lock_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                test_socket.bind(("127.0.0.1", self.redirect_port))
-                test_socket.close()
-                # We got the port, we can proceed with authentication
+                lock_socket.bind(("127.0.0.1", self.redirect_port))
                 self._debug_print("Port available, proceeding with authentication")
             except OSError as e:
+                lock_socket.close()
                 if e.errno == errno.EADDRINUSE:
-                    # Port in use, another auth is in progress
                     self._debug_print("Another authentication is in progress, waiting...")
-                    test_socket.close()
 
-                    # Wait for the other process to complete
                     cached = self._wait_for_auth_completion()
                     if cached:
                         print(json.dumps(cached))
                         return 0
                     else:
-                        # Only print error to stderr for actual failures
                         self._debug_print("Authentication timeout or failed in another process")
                         return 1
                 else:
-                    test_socket.close()
                     raise
 
-            # Check cache again (another process might have just finished)
-            cached = self.get_cached_credentials()
-            if cached:
-                # Output cached credentials (intended behavior for AWS CLI)
-                print(json.dumps(cached))  # noqa: S105
-                return 0
+            # From here we own the port lock; ensure it is always released.
+            try:
+                # Check cache again (another process might have just finished)
+                cached = self.get_cached_credentials()
+                if cached:
+                    print(json.dumps(cached))  # noqa: S105
+                    return 0
 
-            # Authenticate with OIDC provider
-            self._debug_print(f"Authenticating with {self.provider_config['name']} for profile '{self.profile}'...")
-            id_token, token_claims = self.authenticate_oidc()
+                # Try silent refresh using cached id_token before opening browser.
+                # Quota is enforced BEFORE the STS exchange, using the id_token
+                # already in hand, so an over-quota user never mints or caches
+                # fresh credentials on this path (#761).
+                id_token, token_claims = self._get_cached_token_for_silent_refresh()
+                if id_token:
+                    if self._should_check_quota():
+                        quota_result = self._check_quota(token_claims, id_token)
+                        self._save_quota_check_timestamp()
+                        if not quota_result.get("allowed", True):
+                            return self._handle_quota_blocked(quota_result)
+                        self._handle_quota_warning(quota_result)
+
+                    silent_creds = self._try_silent_refresh(id_token, token_claims)
+                    if silent_creds:
+                        print(json.dumps(silent_creds))
+                        return 0
+
+                # Authenticate with OIDC provider (browser popup - only when id_token is also expired).
+                # Hand the still-bound lock socket to the OAuth callback server so
+                # the port is never released between the lock check and the callback.
+                self._debug_print(f"Authenticating with {self.provider_config['name']} for profile '{self.profile}'...")
+                id_token, token_claims = self.authenticate_oidc(lock_socket=lock_socket)
+            finally:
+                try:
+                    lock_socket.close()
+                except Exception:
+                    pass  # nosec B110
 
             # Check quota before issuing credentials (if configured)
             if self._should_check_quota():
@@ -1854,12 +2561,18 @@ class MultiProviderAuth:
             # User cancelled - no output needed
             return 1
         except Exception as e:
+            import traceback
+
             error_msg = str(e)
             # Only print actual errors to stderr
             if "timeout" not in error_msg.lower():
                 print(f"Error: {error_msg}", file=sys.stderr)
+                if self.debug:
+                    traceback.print_exc(file=sys.stderr)
             else:
                 self._debug_print(f"Error: {error_msg}")
+                if self.debug:
+                    traceback.print_exc(file=sys.stderr)
 
             # Provide specific guidance for common errors
             if "NotAuthorizedException" in error_msg and "Token is not from a supported provider" in error_msg:
@@ -1870,7 +2583,7 @@ class MultiProviderAuth:
                 self._debug_print("\nAuthentication timed out. Possible causes:")
                 self._debug_print("- Browser did not complete authentication")
                 self._debug_print("- Network connectivity issues")
-                self._debug_print("- Callback URL was not accessible on localhost:8400")
+                self._debug_print(f"- Callback URL was not accessible on localhost:{self.redirect_port}")
             elif "cognito_user_pool_id is required" in error_msg:
                 print("\nConfiguration error: Missing Cognito User Pool ID", file=sys.stderr)
                 print("Please run 'poetry run ccwb init' to reconfigure.", file=sys.stderr)
@@ -1891,6 +2604,14 @@ def main():
         "--get-monitoring-token", action="store_true", help="Get cached monitoring token instead of AWS credentials"
     )
     parser.add_argument(
+        "--get-mcp-auth-header",
+        action="store_true",
+        help=(
+            'Print {"Authorization":"Bearer <id_token>"} from the cached token for an MCP '
+            "headersHelper (never opens a browser)"
+        ),
+    )
+    parser.add_argument(
         "--clear-cache", action="store_true", help="Clear cached credentials and force re-authentication"
     )
     parser.add_argument(
@@ -1903,8 +2624,49 @@ def main():
         action="store_true",
         help="Refresh credentials if expired (for cron jobs with session storage)",
     )
+    parser.add_argument(
+        "--set-client-secret",
+        action="store_true",
+        default=False,
+        help=(
+            "Store Azure AD client secret in OS secure storage. "
+            "For non-interactive use set CCWB_CLIENT_SECRET env var before running; "
+            "otherwise an interactive prompt is shown. Blank input clears the stored secret."
+        ),
+    )
 
     args = parser.parse_args()
+
+    # Handle --set-client-secret before loading full auth config.
+    # Secrets must never be passed as CLI arguments — they appear in shell history
+    # and process listings.  Use CCWB_CLIENT_SECRET env var for automation, or
+    # the interactive getpass prompt for manual setup.
+    if args.set_client_secret:
+        import getpass
+
+        env_secret = os.environ.get("CCWB_CLIENT_SECRET")
+        if env_secret is not None:
+            if not env_secret:
+                print("Error: CCWB_CLIENT_SECRET is set but empty.", file=sys.stderr)
+                sys.exit(1)
+            secret = env_secret
+        else:
+            secret = getpass.getpass(f"Enter client secret for profile '{args.profile}' (press Enter to clear): ")
+
+        try:
+            if not secret:
+                try:
+                    keyring.delete_password("claude-code-with-bedrock", f"{args.profile}-client-secret")
+                except keyring.errors.PasswordDeleteError:
+                    pass  # Secret already absent, nothing to clear
+                print(f"✓ Client secret cleared for profile '{args.profile}'", file=sys.stderr)
+            else:
+                keyring.set_password("claude-code-with-bedrock", f"{args.profile}-client-secret", secret)
+                print(f"✓ Client secret stored in OS secure storage for profile '{args.profile}'", file=sys.stderr)
+        except Exception as e:
+            print(f"Error managing client secret in keyring: {e}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
 
     auth = MultiProviderAuth(profile=args.profile)
 
@@ -1939,6 +2701,27 @@ def main():
                 # This prevents OTEL helper from using default/unknown values
                 sys.exit(1)
 
+    # Handle MCP auth-header request.
+    # Used as the headersHelper for the AgentCore web-search MCP server, whose
+    # gateway runs a CUSTOM_JWT authorizer validating the same OIDC id_token the
+    # solution already mints. MUST be fast and MUST NOT open a browser — an MCP
+    # headersHelper can never drive an interactive login. So, unlike
+    # --get-monitoring-token, this never falls through to authentication: on a
+    # cache miss it fails cleanly with a non-zero exit.
+    if args.get_mcp_auth_header:
+        header = auth.get_mcp_auth_header()
+        if header:
+            # Compact separators so Go (encoding/json) and Python emit byte-identical output.
+            print(json.dumps(header, separators=(",", ":")))
+            sys.exit(0)
+        else:
+            print(
+                f"Error: no valid cached token for profile '{args.profile}'; "
+                "run the credential process once to authenticate.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     # Handle check-expiration request
     if args.check_expiration:
         is_expired = auth.check_credentials_file_expiration(args.profile)
@@ -1969,4 +2752,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+
+        print(f"Error: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)

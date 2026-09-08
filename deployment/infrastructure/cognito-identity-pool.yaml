@@ -60,7 +60,7 @@ Parameters:
 
   AllowedBedrockRegions:
     Type: CommaDelimitedList
-    Default: 'us-east-1,us-east-2,us-west-1,us-west-2,eu-west-1,eu-west-3,eu-central-1,eu-north-1,eu-south-1,eu-south-2,ap-northeast-1,ap-southeast-1,ap-southeast-2,ap-southeast-3,ap-south-1'
+    Default: 'af-south-1,ap-east-2,ap-northeast-1,ap-northeast-2,ap-northeast-3,ap-south-1,ap-south-2,ap-south-5,ap-southeast-1,ap-southeast-2,ap-southeast-3,ap-southeast-4,ca-central-1,ca-west-1,eu-central-1,eu-central-2,eu-north-1,eu-south-1,eu-south-2,eu-south-3,eu-west-1,eu-west-2,eu-west-3,il-central-1,me-central-1,me-south-1,sa-east-1,us-east-1,us-east-2,us-west-1,us-west-2'
     Description: AWS regions allowed for Bedrock access (configured based on selected model and cross-region profile)
 
   EnableMonitoring:
@@ -106,7 +106,10 @@ Resources:
       CognitoIdentityProviders: !If
         - UseCognitoUserPool
         - - ClientId: !Ref CognitoUserPoolClientId
-            ProviderName: !Sub 'cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}'
+            # Region derived from the User Pool ID, not AWS::Region (see issue #596).
+            ProviderName: !Sub
+              - 'cognito-idp.${PoolRegion}.amazonaws.com/${CognitoUserPoolId}'
+              - PoolRegion: !Select [0, !Split ['_', !Ref CognitoUserPoolId]]
             ServerSideTokenCheck: true
         - !Ref 'AWS::NoValue'
 
@@ -137,9 +140,13 @@ Resources:
             Action:
               - 'bedrock:InvokeModel'
               - 'bedrock:InvokeModelWithResponseStream'
+              - 'bedrock:CallWithBearerToken'
+              - 'bedrock:ListFoundationModels'
+              - 'bedrock:ListInferenceProfiles'
             Resource:
               - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
               - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:*:application-inference-profile/*'
             Condition:
               StringEquals:
                 'aws:RequestedRegion': !Ref AllowedBedrockRegions
@@ -164,9 +171,6 @@ Resources:
               Resource: '*'
               Condition:
                 StringEquals:
-                  'cloudwatch:namespace':
-                    - 'ClaudeCode'
-                    - 'AWS/Bedrock'
                   'aws:RequestedRegion': !Ref AllowedBedrockRegions
             - !Ref 'AWS::NoValue'
 
@@ -279,7 +283,10 @@ Resources:
       IdentityProviderName: !If
         - UseExternalOIDC
         - !Ref OIDCProviderDomain
-        - !Sub 'cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}'
+        # Region derived from the User Pool ID, not AWS::Region (see issue #596).
+        - !Sub
+          - 'cognito-idp.${PoolRegion}.amazonaws.com/${CognitoUserPoolId}'
+          - PoolRegion: !Select [0, !Split ['_', !Ref CognitoUserPoolId]]
       UseDefaults: false
       PrincipalTags:
         UserEmail: email

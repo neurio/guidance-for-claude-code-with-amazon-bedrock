@@ -5,13 +5,11 @@ Parameters:
   MonthlyTokenLimit:
     Type: Number
     Default: 10000000
-    Description: Default monthly token limit per user (10M tokens) - used when no policy is defined
-    MinValue: 1000000
+    Description: >-
+      Default monthly token limit per user (10M tokens) - used when no policy
+      is defined. 0 disables token-denominated limits (cost-based quota mode).
+    MinValue: 0
     MaxValue: 1000000000
-
-  MetricsTableArn:
-    Type: String
-    Description: ARN of the ClaudeCodeMetrics table from the dashboard stack
 
   WarningThreshold80:
     Type: Number
@@ -46,26 +44,75 @@ Parameters:
       - 'block'
     Description: Enforcement mode for monthly limits - alert (warn only) or block (deny access)
 
-  MetricsAggregatorRoleName:
-    Type: String
-    Description: Name of the MetricsAggregatorRole from the dashboard stack
-
   EnableFinegrainedQuotas:
     Type: String
-    Default: 'true'
+    Default: 'false'
     AllowedValues:
       - 'true'
       - 'false'
     Description: Enable fine-grained quota policies (user/group/default levels)
 
+  EnableBypassDetection:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Detect users invoking Bedrock without a running OTEL sidecar by joining
+      CloudTrail Bedrock activity against OTEL-reported usage. Reports via
+      CloudWatch metrics and SNS alerts (detective control, does not block).
+      Opt-in compliance/audit feature; applies to sidecar monitoring mode.
+
+  BypassDetectionLookbackMinutes:
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 60
+    Description: Lookback window (minutes) for bypass detection - should match the detection schedule
+
+  QuotaMode:
+    Type: String
+    Default: 'token'
+    AllowedValues:
+      - 'token'
+      - 'cost'
+    Description: >-
+      Quota enforcement mode. 'token' counts raw tokens (existing behavior).
+      'cost' converts tokens to estimated USD using Bedrock pricing rates and
+      compares against dollar-denominated limits.
+
+  MonthlyCostLimitUsd:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >-
+      Monthly cost limit per user in USD (cost mode only). 0 = no limit.
+      Example: 500 = block at $500/month estimated spend.
+
+  DailyCostLimitUsd:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >-
+      Daily cost limit per user in USD (cost mode only). 0 = no limit.
+      Example: 50 = block at $50/day estimated spend.
+
   # JWT Authentication Parameters for Quota Check API
   OidcIssuerUrl:
     Type: String
-    Description: OIDC provider issuer URL for JWT validation (e.g., https://company.okta.com)
+    Default: ''
+    Description: OIDC provider issuer URL for JWT validation (e.g., https://company.okta.com) - leave empty to disable JWT auth
 
   OidcClientId:
     Type: String
+    Default: ''
     Description: OIDC client ID (audience) for JWT validation
+
+Conditions:
+  HasJwtAuth: !Not [!Equals [!Ref OidcIssuerUrl, '']]
+  NoJwtAuth: !Equals [!Ref OidcIssuerUrl, '']
+  BypassDetectionEnabled: !Equals [!Ref EnableBypassDetection, 'true']
 
 Resources:
   # DynamoDB table for quota policies (user, group, default levels)
@@ -143,6 +190,11 @@ Resources:
   # IAM Role for Quota Monitor Lambda
   QuotaMonitorRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "CloudWatch GetMetricData/ListMetrics and CloudTrail LookupEvents require Resource: * by API design"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -152,7 +204,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
         - PolicyName: QuotaMonitorPolicy
           PolicyDocument:
@@ -162,10 +214,10 @@ Resources:
                 Action:
                   - dynamodb:Query
                   - dynamodb:PutItem
+                  - dynamodb:UpdateItem
                   - dynamodb:GetItem
                   - dynamodb:Scan
                 Resource:
-                  - !Ref MetricsTableArn
                   - !GetAtt UserQuotaMetrics.Arn
               - Effect: Allow
                 Action:
@@ -179,10 +231,22 @@ Resources:
                 Action:
                   - sns:Publish
                 Resource: !Ref QuotaAlertTopic
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                Resource: '*'
 
   # Lambda function for quota monitoring
   QuotaMonitorFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda invoked by EventBridge schedule, requires internet access for CloudWatch/DynamoDB/SNS — VPC adds complexity without security benefit"
+          - id: W92
+            reason: "Event-driven single invocation every 15 min — reserved concurrency unnecessary"
     Properties:
       FunctionName: claude-code-quota-monitor
       Description: Monitors user token usage and sends alerts when quotas are exceeded
@@ -203,6 +267,9 @@ Resources:
           DAILY_ENFORCEMENT_MODE: !Ref DailyEnforcementMode
           MONTHLY_ENFORCEMENT_MODE: !Ref MonthlyEnforcementMode
           ENABLE_FINEGRAINED_QUOTAS: !Ref EnableFinegrainedQuotas
+          MONTHLY_COST_LIMIT_USD: !Ref MonthlyCostLimitUsd
+          DAILY_COST_LIMIT_USD: !Ref DailyCostLimitUsd
+          METRICS_REGION: !Ref 'AWS::Region'
       Code: ./lambda-functions/quota_monitor/
 
   # EventBridge Rule to run quota monitor every 15 minutes
@@ -227,6 +294,104 @@ Resources:
       SourceArn: !GetAtt QuotaMonitorScheduleRule.Arn
 
   # ============================================
+  # Sidecar Bypass Detection (detective control)
+  # Detects users invoking Bedrock without a running OTEL sidecar by joining
+  # CloudTrail Bedrock activity (tamper-proof) against OTEL-reported usage.
+  # ============================================
+
+  # IAM Role for Bypass Detection Lambda
+  SidecarMonitorRole:
+    Type: AWS::IAM::Role
+    Condition: BypassDetectionEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: BypassDetectionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Point reads on per-user records to check telemetry freshness
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt UserQuotaMetrics.Arn
+              # Tamper-proof source of truth for who actually invoked Bedrock
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: '*'
+              # Publish per-user sidecar health metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'ClaudeCode/SidecarHealth'
+              # Alert administrators about stopped sidecars
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref QuotaAlertTopic
+
+  # Lambda function for sidecar bypass detection
+  SidecarMonitorFunction:
+    Type: AWS::Lambda::Function
+    Condition: BypassDetectionEnabled
+    Properties:
+      FunctionName: claude-code-bypass-detection
+      Description: Detects users invoking Bedrock without a running OTEL sidecar (detective control)
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt SidecarMonitorRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          QUOTA_TABLE: !Ref UserQuotaMetrics
+          SNS_TOPIC_ARN: !Ref QuotaAlertTopic
+          METRICS_REGION: !Ref 'AWS::Region'
+          LOOKBACK_MINUTES: !Ref BypassDetectionLookbackMinutes
+          CLOUDWATCH_NAMESPACE: 'ClaudeCode/SidecarHealth'
+      Code: ./lambda-functions/sidecar_monitor/
+
+  # EventBridge Rule to run bypass detection every 15 minutes
+  SidecarMonitorScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: BypassDetectionEnabled
+    Properties:
+      Name: claude-code-bypass-detection-schedule
+      Description: Trigger sidecar bypass detection every 15 minutes
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SidecarMonitorFunction.Arn
+          Id: BypassDetectionTarget
+
+  # Permission for EventBridge to invoke the bypass detection Lambda
+  SidecarMonitorSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: BypassDetectionEnabled
+    Properties:
+      FunctionName: !Ref SidecarMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SidecarMonitorScheduleRule.Arn
+
+  # ============================================
+  # End Sidecar Bypass Detection
+  # ============================================
+
+  # ============================================
   # Quota Check API (Phase 2 - Access Blocking)
   # ============================================
 
@@ -242,7 +407,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
         - PolicyName: QuotaCheckPolicy
           PolicyDocument:
@@ -274,8 +439,11 @@ Resources:
           POLICIES_TABLE: !Ref QuotaPolicies
           MONTHLY_TOKEN_LIMIT: !Ref MonthlyTokenLimit
           DAILY_TOKEN_LIMIT: !Ref DailyTokenLimit
+          MONTHLY_COST_LIMIT_USD: !Ref MonthlyCostLimitUsd
+          DAILY_COST_LIMIT_USD: !Ref DailyCostLimitUsd
           DAILY_ENFORCEMENT_MODE: !Ref DailyEnforcementMode
           MONTHLY_ENFORCEMENT_MODE: !Ref MonthlyEnforcementMode
+          ENABLE_FINEGRAINED_QUOTAS: !Ref EnableFinegrainedQuotas
       Code: ./lambda-functions/quota_check/
 
   # HTTP API Gateway (v2 - cheaper and faster than REST API)
@@ -296,8 +464,9 @@ Resources:
           - Authorization
         MaxAge: 300
 
-  # JWT Authorizer for OIDC token validation
+  # JWT Authorizer for OIDC token validation (only when SSO is enabled)
   QuotaCheckAuthorizer:
+    Condition: HasJwtAuth
     Type: AWS::ApiGatewayV2::Authorizer
     Properties:
       ApiId: !Ref QuotaCheckApi
@@ -319,15 +488,17 @@ Resources:
       IntegrationUri: !GetAtt QuotaCheckFunction.Arn
       PayloadFormatVersion: '2.0'
 
-  # Route for GET /check (JWT authenticated)
+  # Route for GET /check — single resource to avoid route-key conflict on
+  # in-place updates (two resources sharing the same RouteKey causes CFN 409).
+  # Uses !If to switch between JWT auth (OIDC) and IAM auth (IDC/none).
   QuotaCheckRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref QuotaCheckApi
       RouteKey: 'GET /check'
       Target: !Sub 'integrations/${QuotaCheckIntegration}'
-      AuthorizerId: !Ref QuotaCheckAuthorizer
-      AuthorizationType: JWT
+      AuthorizerId: !If [HasJwtAuth, !Ref QuotaCheckAuthorizer, !Ref 'AWS::NoValue']
+      AuthorizationType: !If [HasJwtAuth, 'JWT', 'AWS_IAM']
 
   # Default stage with auto-deploy
   QuotaCheckStage:
@@ -344,36 +515,30 @@ Resources:
       FunctionName: !Ref QuotaCheckFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${QuotaCheckApi}/*'
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${QuotaCheckApi}/*'
 
   # ============================================
   # End Quota Check API
   # ============================================
 
-  # Grant MetricsAggregator permissions to write to quota table and read policies
-  MetricsAggregatorQuotaPolicy:
-    Type: AWS::IAM::Policy
+  # IAM Managed Policy granting execute-api:Invoke on the quota API.
+  # Required for IAM-auth callers (IDC permission sets, federated roles).
+  # The credential-process signs requests with SigV4, and API Gateway
+  # requires the caller to have this permission in their identity policy.
+  # Admins should attach this policy to their IDC permission set or IAM role.
+  QuotaApiInvokePolicy:
+    Condition: NoJwtAuth
+    Type: AWS::IAM::ManagedPolicy
     Properties:
-      PolicyName: MetricsAggregatorQuotaAccess
+      ManagedPolicyName: !Sub '${AWS::StackName}-QuotaApiInvoke'
+      Description: 'Allows invoke on the quota check API Gateway (required for IAM-auth callers)'
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
-            Action:
-              - dynamodb:PutItem
-              - dynamodb:UpdateItem
-              - dynamodb:GetItem
-            Resource:
-              - !GetAtt UserQuotaMetrics.Arn
-          - Effect: Allow
-            Action:
-              - dynamodb:Query
-              - dynamodb:GetItem
-            Resource:
-              - !GetAtt QuotaPolicies.Arn
-              - !Sub '${QuotaPolicies.Arn}/index/*'
-      Roles:
-        - !Ref MetricsAggregatorRoleName
+          - Sid: AllowQuotaApiInvoke
+            Effect: Allow
+            Action: 'execute-api:Invoke'
+            Resource: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${QuotaCheckApi}/*'
 
 Outputs:
   QuotaTableName:
@@ -423,3 +588,19 @@ Outputs:
     Value: !GetAtt QuotaCheckFunction.Arn
     Export:
       Name: !Sub '${AWS::StackName}-QuotaCheckFunctionArn'
+
+  SidecarMonitorFunctionArn:
+    Condition: BypassDetectionEnabled
+    Description: ARN of the sidecar bypass-detection Lambda function
+    Value: !GetAtt SidecarMonitorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SidecarMonitorFunctionArn'
+
+  QuotaApiInvokePolicyArn:
+    Condition: NoJwtAuth
+    Description: >-
+      IAM Managed Policy ARN granting execute-api:Invoke on the quota API.
+      Attach this to your IDC permission set or IAM role used by Claude Code users.
+    Value: !Ref QuotaApiInvokePolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaApiInvokePolicyArn'

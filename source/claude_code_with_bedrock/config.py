@@ -5,9 +5,13 @@
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# AWS regions where the Amazon Bedrock AgentCore managed Web Search connector
+# is available. Extend this list as regional availability expands.
+WEBSEARCH_SUPPORTED_REGIONS = ["us-east-1"]
 
 
 @dataclass
@@ -23,6 +27,7 @@ class Profile:
     schema_version: str = "2.0"  # Configuration schema version
     stack_names: dict[str, str] = field(default_factory=dict)
     monitoring_enabled: bool = True
+    monitoring_mode: str = "central"  # "sidecar" (local collector) or "central" (ECS Fargate)
     monitoring_config: dict[str, Any] = field(default_factory=dict)
     analytics_enabled: bool = True  # Analytics pipeline for user metrics
     metrics_log_group: str = "/aws/claude-code/metrics"
@@ -32,22 +37,56 @@ class Profile:
     allowed_bedrock_regions: list[str] = field(default_factory=list)
     cross_region_profile: str | None = None  # Cross-region profile: "us", "europe", "apac"
     selected_model: str | None = None  # Selected Claude model ID (e.g., "us.anthropic.claude-3-7-sonnet-20250805-v1:0")
+    model_alias: str | None = None  # Claude Code alias for ANTHROPIC_MODEL: "sonnet", "opus", "opusplan", "haiku"
+    lock_default_model: bool = (
+        False  # Write ANTHROPIC_MODEL + DEFAULT_*_MODEL into managed-settings (locks users to admin's choice)
+    )
     selected_source_region: str | None = None  # User-selected source region for AWS config and Claude Code settings
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    updated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    provider_type: str | None = None  # Auto-detected: "okta", "auth0", "azure", "cognito"
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    provider_type: str | None = None  # Auto-detected: "okta", "auth0", "azure", "cognito", "google", "generic"
     cognito_user_pool_id: str | None = None  # Only for Cognito User Pool providers
+    okta_auth_server: str = (
+        ""  # Okta authorization server ID ("default" for dev/free plans, empty for Org server on paid plans)
+    )
+
+    # Generic OIDC provider configuration (provider_type == "generic")
+    # Required when the IdP isn't Okta/Auth0/Azure/Cognito (e.g. PingFederate, Keycloak, ForgeRock).
+    # When set, these override the hardcoded paths in PROVIDER_CONFIGS.
+    oidc_issuer_url: str | None = None  # e.g. https://auth.example.com (no trailing slash)
+    oidc_authorization_endpoint: str | None = None  # Full URL or path appended to issuer
+    oidc_token_endpoint: str | None = None  # Full URL or path appended to issuer
+    oidc_jwks_uri: str | None = None  # Full URL to JWKS endpoint
+    oidc_thumbprint: str | None = None  # SHA-1 thumbprint of root cert in JWKS TLS chain
+    oidc_prompt: str | None = None  # OIDC prompt param for Azure auth (default "select_account", "" to skip)
     enable_codebuild: bool = False  # Enable CodeBuild for Windows binary builds
+    codebuild_region: str | None = None  # Region for CodeBuild stack/builds; falls back to aws_region when unset
+    codebuild_prior_regions: list[str] = field(
+        default_factory=list
+    )  # Regions a CodeBuild stack was previously deployed to (so destroy can clean orphans after a region change)
     enable_distribution: bool = False  # Enable package distribution features (legacy, use distribution_type)
 
     # Distribution platform configuration
     distribution_type: str | None = None  # "presigned-s3" | "landing-page" | None (disabled)
-    distribution_idp_provider: str | None = None  # "okta" | "azure" | "auth0" | "cognito" (for landing-page only)
+    distribution_idp_provider: str | None = None  # okta|azure|auth0|cognito|generic (landing-page only)
     distribution_idp_domain: str | None = None  # IdP domain for web auth (e.g., "company.okta.com")
     distribution_idp_client_id: str | None = None  # Web application client ID
     distribution_idp_client_secret_arn: str | None = None  # Secrets Manager ARN for client secret
     distribution_custom_domain: str | None = None  # Optional custom domain (e.g., "downloads.company.com")
     distribution_hosted_zone_id: str | None = None  # Optional Route53 hosted zone ID
+
+    # Generic OIDC distribution config (distribution_idp_provider == "generic").
+    # Required when the landing-page IdP isn't Okta/Azure/Auth0/Cognito (e.g. PingFederate,
+    # Keycloak, ForgeRock). Unlike those providers, ALB authenticate-oidc endpoints cannot be
+    # derived from a single domain, so each must be supplied explicitly. The ALB runs the OAuth
+    # authorization-code flow (not JWT signature validation), so no JWKS/thumbprint is needed here.
+    distribution_idp_issuer: str | None = None  # OIDC issuer URL (must match the 'iss' claim)
+    distribution_idp_authorization_endpoint: str | None = None  # Full authorization endpoint URL
+    distribution_idp_token_endpoint: str | None = None  # Full token endpoint URL
+    distribution_idp_userinfo_endpoint: str | None = None  # Full userinfo endpoint URL
+
+    # IDC/SAML distribution config (only populated when auth_type == "idc" and distribution_type == "landing-page")
+    distribution_saml_metadata_url: str | None = None  # SAML metadata URL from IAM Identity Center
 
     # Quota monitoring configuration
     quota_monitoring_enabled: bool = False  # Enable per-user token quota monitoring
@@ -64,14 +103,100 @@ class Profile:
     quota_api_endpoint: str | None = None  # API Gateway endpoint for real-time quota checks
     quota_fail_mode: str = "open"  # "open" (allow on error) or "closed" (deny on error)
     quota_check_interval: int = 30  # Minutes between quota re-checks (0 = every request)
+    enable_bypass_detection: bool = False  # Detect Bedrock use without a running OTEL sidecar (opt-in)
+    # Cost-based quota (limit_type "cost"): dollar budgets per user, enforced
+    # server-side from per-model Bedrock pricing. In cost mode the token limits
+    # above are set to 0 (disabled) and these become the sole control.
+    quota_limit_type: str = "token"  # "token" (raw counts) or "cost" ($ budgets)
+    monthly_cost_limit_usd: float = 0.0  # Monthly $ budget per user (0 = no cost limit)
+    daily_cost_limit_usd: float = 0.0  # Daily $ cap per user (0 = no daily cap)
+
+    # Monitoring endpoint (saved from deploy, avoids re-reading CloudFormation outputs)
+    otel_collector_endpoint: str | None = None  # OTel collector ALB endpoint URL
 
     # Federation configuration
     federation_type: str = "cognito"  # "cognito" or "direct"
     federated_role_arn: str | None = None  # ARN for Direct STS federation
     max_session_duration: int = 28800  # 8 hours default, 43200 (12 hours) for Direct STS
+    sso_enabled: bool = True  # Enable SSO authentication (Okta, Auth0, Azure, Cognito)
+
+    # Authentication type — explicit three-way classification
+    # "oidc"  = OIDC/Direct IdP path (Okta, Azure AD, Auth0, Cognito, Google) — default
+    # "idc"   = AWS IAM Identity Center path
+    # "none"  = no SSO, use existing AWS credentials directly
+    auth_type: str = "oidc"
+
+    # IAM Identity Center specific fields (only populated when auth_type == "idc")
+    idc_start_url: str | None = None  # e.g. https://company.awsapps.com/start
+    idc_account_id: str | None = None  # AWS account ID for IDC access
+    idc_permission_set_name: str | None = None  # Permission set / role name
+    sso_region: str | None = None  # AWS region where Identity Center is configured
+
+    # Confidential client authentication (Azure AD / Entra ID)
+    # If neither is set, public client flow is used (current default).
+    # If azure_auth_mode == "secret", the client secret is stored in the OS keyring
+    #   (never in config.json). Read at runtime via keyring by the credential provider.
+    # If azure_auth_mode == "certificate", certificate paths are stored in config.json
+    #   and used to build a signed JWT assertion.
+    azure_auth_mode: str | None = None  # "public", "secret", or "certificate"
+    # Azure (azure_auth_mode == "secret"): confidential — loaded from OS keyring at runtime,
+    #   never written to config.json.
+    # Google: non-confidential per Google's installed-app OAuth docs — persisted in
+    #   config.json and shipped to end users by `ccwb package`. See config-sync.md.
+    client_secret: str | None = None
+    client_certificate_path: str | None = None  # Path to PEM certificate file
+    client_certificate_key_path: str | None = None  # Path to PEM private key file
+
+    # OAuth callback port (also used for inter-process locking)
+    redirect_port: int | None = None  # OAuth callback port (default 8400); must match IdP registered redirect URI
+
+    # Resource tagging
+    tags: dict[str, str] = field(default_factory=dict)  # Tags applied to all deployed CloudFormation stacks
+    # Application Inference Profile support (per-tier ARNs)
+    inference_profile_opus_arn: str | None = None  # Optional inference profile ARN for Opus tier
+    inference_profile_sonnet_arn: str | None = None  # Optional inference profile ARN for Sonnet tier
+    inference_profile_haiku_arn: str | None = None  # Optional inference profile ARN for Haiku tier
 
     # Claude Code settings configuration
     include_coauthored_by: bool = True  # Whether to include "co-authored-by Claude" in git commits
+
+    # Settings deployment target
+    # "user" = ~/.claude/settings.json (default, lowest precedence)
+    # "managed" = OS-level managed-settings.json (highest precedence, non-overridable)
+    settings_target: str = "user"
+
+    # Claude Cowork 3P MDM configuration
+    cowork_3p_enabled: bool = True  # Generate CoWork 3P MDM configs during packaging
+    cowork_3p_extra_keys: dict[str, str] = field(default_factory=dict)  # Custom MDM keys merged into CoWork 3P output
+    cowork_service_token: str = ""  # Static token for CoWork ALB auth bypass (set during init)
+    cowork_credential_mode: str = (
+        "helper"  # "helper" (inferenceCredentialHelper) or "profile" (inferenceBedrockProfile)
+    )
+    cowork_credential_helper_ttl_sec: int = 3500  # inferenceCredentialHelperTtlSec (refresh before 1h STS expiry)
+    cowork_config_delivery: str = "static"  # "static" | "bootstrap-device-code" | "bootstrap-oidc-bearer"
+
+    # Cowork beta features (managed configuration keys)
+    cowork_chat_tab_enabled: bool = True  # chatTabEnabled — enables the Chat tab
+    cowork_chat_advanced_file_analysis: bool = (
+        True  # chatAdvancedFileAnalysisEnabled — code execution for file analysis
+    )
+    cowork_inference_session_lifetime_sec: int | None = None  # inferenceSessionLifetimeSec — re-auth reminder timer
+    # Web search (AgentCore Gateway + managed Web Search connector)
+    # Opt-in, default off. Deploys an optional AgentCore Gateway stack whose
+    # inbound CUSTOM_JWT authorizer reuses the existing OIDC IdP. The gateway
+    # serves both Claude Code (via headersHelper) and Claude Cowork (via MDM).
+    web_search_enabled: bool = False  # Enable the web search gateway
+    websearch_gateway_url: str = ""  # Gateway MCP endpoint URL (populated after deploy)
+    websearch_region: str | None = None  # Region for the gateway stack (allow-list; None = default us-east-1)
+    websearch_jwt_audience: str | None = None  # Entra ID (audience mode) only: aud the authorizer accepts
+    websearch_domain_denylist: list[str] = field(default_factory=list)  # Optional domains to exclude from results
+    websearch_headers_helper_path: str = ""  # Absolute path override for the Cowork headersHelper (default: ~/claude-code-with-bedrock/websearch-headers)
+
+    # Admin-only extra files copied into the package on top of generated artifacts.
+    # Consumed ONLY by `package`/`distribute` — deliberately NOT mirrored in the Go
+    # ProfileConfig (config-sync.md) and NOT written to the runtime config.json.
+    # Each entry: {"name": str, "targets": str | list[str], "from": str}
+    extra_files: list[dict[str, Any]] = field(default_factory=list)
 
     # Legacy field support
     @property
@@ -83,6 +208,13 @@ class Profile:
     def okta_client_id(self) -> str:
         """Legacy property for backward compatibility."""
         return self.client_id
+
+    @property
+    def effective_auth_type(self) -> str:
+        """Resolve auth_type with backward compatibility for sso_enabled."""
+        if hasattr(self, "auth_type") and self.auth_type:
+            return self.auth_type
+        return "oidc" if self.sso_enabled else "none"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert profile to dictionary."""
@@ -109,6 +241,19 @@ class Profile:
         if "credential_storage" not in data:
             data["credential_storage"] = "session"
 
+        # Derive auth_type from sso_enabled for backward compatibility
+        if "auth_type" not in data:
+            if data.get("sso_enabled", True):
+                data["auth_type"] = "oidc"
+            else:
+                data["auth_type"] = "none"
+
+        # Infer sso_enabled for profiles saved before PR #71 introduced the field:
+        # if provider_domain is set to a real value, SSO was enabled.
+        if "sso_enabled" not in data:
+            domain = data.get("provider_domain", "none")
+            data["sso_enabled"] = bool(domain and domain != "none")
+
         # Auto-detect provider type if not set
         if "provider_type" not in data and "provider_domain" in data:
             domain = data["provider_domain"]
@@ -128,7 +273,12 @@ class Profile:
 
                         # Check for exact domain match or subdomain match
                         # Using endswith with leading dot prevents bypass attacks
-                        if hostname_lower.endswith(".okta.com") or hostname_lower == "okta.com":
+                        okta_domains = (".okta.com", ".oktapreview.com", ".okta-emea.com")
+                        if hostname_lower.endswith(okta_domains) or hostname_lower in (
+                            "okta.com",
+                            "oktapreview.com",
+                            "okta-emea.com",
+                        ):
                             data["provider_type"] = "okta"
                         elif hostname_lower.endswith(".auth0.com") or hostname_lower == "auth0.com":
                             data["provider_type"] = "auth0"
@@ -138,14 +288,39 @@ class Profile:
                             data["provider_type"] = "azure"
                         elif hostname_lower.endswith(".amazoncognito.com") or hostname_lower == "amazoncognito.com":
                             data["provider_type"] = "cognito"
+                        elif hostname_lower.startswith("cognito-idp.") and ".amazonaws.com" in hostname_lower:
+                            data["provider_type"] = "cognito"
+                        elif hostname_lower == "accounts.google.com":
+                            data["provider_type"] = "google"
                 except Exception:
                     pass  # Leave provider_type unset if parsing fails
+
+        # Heal profiles corrupted by questionary's value=None fallback: Choice
+        # values of None fall back to the choice TITLE, so the wizard's
+        # "Disabled" option saved enable_distribution=True with
+        # distribution_type="Disabled" — making sidecar deploys schedule the
+        # networking + distribution stacks. The same fallback could store
+        # choice titles as the CodeBuild region or Route53 hosted zone ID
+        # (titles contain spaces; valid values never do). Must run BEFORE the
+        # legacy migration below, which would otherwise legitimize the value.
+        if data.get("distribution_type") not in (None, "presigned-s3", "landing-page"):
+            data["distribution_type"] = None
+            data["enable_distribution"] = False
+        if data.get("codebuild_region") and " " in str(data["codebuild_region"]):
+            data["codebuild_region"] = None
+        if data.get("distribution_hosted_zone_id") and " " in str(data["distribution_hosted_zone_id"]):
+            data["distribution_hosted_zone_id"] = None
 
         # Migrate legacy distribution configuration
         if "enable_distribution" in data and data.get("enable_distribution"):
             # If distribution was enabled but no type specified, default to presigned-s3
             if "distribution_type" not in data or data["distribution_type"] is None:
                 data["distribution_type"] = "presigned-s3"
+
+        # Ensure monitoring_mode defaults to "central" for existing profiles
+        # (new profiles created via init will explicitly set "sidecar")
+        if "monitoring_mode" not in data:
+            data["monitoring_mode"] = "central"
 
         # Set default cross-region profile if not present
         if "cross_region_profile" not in data:
@@ -154,6 +329,12 @@ class Profile:
                 regions = data["allowed_bedrock_regions"]
                 if any(r.startswith("us-") for r in regions):
                     data["cross_region_profile"] = "us"
+
+        # Filter out any keys not in the Profile dataclass to prevent TypeError
+        import dataclasses
+
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        data = {k: v for k, v in data.items() if k in valid_fields}
 
         return cls(**data)
 
@@ -193,7 +374,7 @@ class Config:
         # Load global config
         if cls.CONFIG_FILE.exists():
             try:
-                with open(cls.CONFIG_FILE) as f:
+                with open(cls.CONFIG_FILE, encoding="utf-8") as f:
                     data = json.load(f)
 
                 return cls(
@@ -215,7 +396,7 @@ class Config:
             "profiles_dir": str(self.PROFILES_DIR),
         }
 
-        with open(self.CONFIG_FILE, "w") as f:
+        with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
     def load_profile(self, name: str | None = None) -> Profile:
@@ -242,7 +423,7 @@ class Config:
             raise FileNotFoundError(f"Profile not found: {profile_name}")
 
         try:
-            with open(profile_path) as f:
+            with open(profile_path, encoding="utf-8") as f:
                 data = json.load(f)
 
             return Profile.from_dict(data)
@@ -259,12 +440,11 @@ class Config:
         # Validate profile name
         if not self._is_valid_profile_name(profile.name):
             raise ValueError(
-                f"Invalid profile name: {profile.name}. "
-                "Name must be alphanumeric with hyphens only, max 64 characters."
+                f"Invalid profile name: {profile.name}. Name must be alphanumeric with hyphens only, max 64 characters."
             )
 
         # Update timestamp
-        profile.updated_at = datetime.utcnow().isoformat()
+        profile.updated_at = datetime.now(timezone.utc).isoformat()
 
         # Ensure profile directory exists
         self.PROFILES_DIR.mkdir(parents=True, exist_ok=True)
@@ -272,7 +452,7 @@ class Config:
         # Save to file
         profile_path = self.PROFILES_DIR / f"{profile.name}.json"
 
-        with open(profile_path, "w") as f:
+        with open(profile_path, "w", encoding="utf-8") as f:
             json.dump(profile.to_dict(), f, indent=2)
 
         # Set as active if it's the first profile
@@ -414,10 +594,15 @@ class Config:
         if not profile:
             raise ValueError(f"Profile not found: {profile_name}")
 
+        # Expand sentinels (e.g. "all-commercial") into concrete regions — the
+        # value feeds the role's aws:RequestedRegion IAM condition, which would
+        # deny every invoke if handed a sentinel that matches no real region.
+        from claude_code_with_bedrock.models import expand_bedrock_regions
+
         return {
             "OktaDomain": profile.okta_domain,
             "OktaClientId": profile.okta_client_id,
             "IdentityPoolName": profile.identity_pool_name,
-            "AllowedBedrockRegions": ",".join(profile.allowed_bedrock_regions),
+            "AllowedBedrockRegions": ",".join(expand_bedrock_regions(profile.allowed_bedrock_regions)),
             "EnableMonitoring": "true" if profile.monitoring_enabled else "false",
         }

@@ -108,6 +108,19 @@ class CloudFormationManager:
             # Read template
             template_body = self._read_template(template_path)
 
+            # CloudFormation's CreateStack/UpdateStack APIs cap TemplateBody at
+            # 51,200 bytes. Templates larger than that must be uploaded to S3
+            # and referenced via TemplateURL (1 MB cap). Fail fast here with a
+            # clear message so the user can trim the template rather than
+            # sitting through a partial deploy that rolls back.
+            template_bytes = len(template_body.encode("utf-8"))
+            if template_bytes > 51200:
+                raise CloudFormationError(
+                    f"Template {template_path} is {template_bytes} bytes, which exceeds the "
+                    f"CloudFormation inline TemplateBody limit of 51,200 bytes. "
+                    f"Trim the template (or open a PR to add TemplateURL/S3 upload support)."
+                )
+
             # Check if stack exists
             exists, current_status = self._check_stack_exists(stack_name)
 
@@ -278,6 +291,128 @@ class CloudFormationManager:
         except Exception:
             return []
 
+    def get_retained_resources(self, stack_name: str) -> list[dict[str, str]]:
+        """Get resources retained (DeletionPolicy: Retain) during stack deletion.
+
+        These resources are silently skipped by CloudFormation and won't appear
+        in get_failed_resources(). They still exist in the account.
+
+        Co-authored-by: peepeepopapapeepeepo (from PR #330)
+        """
+        try:
+            response = self.cf_client.describe_stack_resources(StackName=stack_name)
+            retained = []
+            for resource in response.get("StackResources", []):
+                if resource["ResourceStatus"] == "DELETE_SKIPPED":
+                    retained.append(
+                        {
+                            "logical_id": resource["LogicalResourceId"],
+                            "physical_id": resource.get("PhysicalResourceId", "N/A"),
+                            "resource_type": resource["ResourceType"],
+                            "status_reason": "DeletionPolicy: Retain",
+                        }
+                    )
+            return retained
+        except ClientError:
+            return []
+        except Exception:
+            return []
+
+    def _retained_logical_ids(self, stack_name: str) -> set[str]:
+        """Logical IDs in the stack's template marked DeletionPolicy: Retain."""
+        template_resp = self.cf_client.get_template(StackName=stack_name)
+        template_body = template_resp.get("TemplateBody", {})
+        # CloudFormation returns a YAML template verbatim, short-form intrinsics
+        # (!Ref, !Sub, !GetAtt) included, so it needs the CFN-aware parser.
+        # JSON templates already come back as a dict.
+        if isinstance(template_body, str):
+            template_body = cfn_flip.load_yaml(template_body)
+        resources = template_body.get("Resources", {})
+        return {
+            logical_id
+            for logical_id, resource_def in resources.items()
+            if isinstance(resource_def, dict) and resource_def.get("DeletionPolicy") == "Retain"
+        }
+
+    def pre_cleanup_stack(self, stack_name: str, on_event: Callable | None = None) -> None:
+        """Pre-clean resources that block CloudFormation deletion.
+
+        S3 buckets must be empty before CF can delete them.
+        Athena workgroups must have named queries removed first.
+        Skips resources with DeletionPolicy: Retain (kept intentionally).
+
+        Co-authored-by: peepeepopapapeepeepo (from PR #330)
+        """
+        import logging
+
+        try:
+            try:
+                retained_logical_ids = self._retained_logical_ids(stack_name)
+            except Exception as e:
+                # Without the retention list there is no way to tell a disposable
+                # bucket from one the operator asked to keep, so don't pre-clean
+                # at all. A stack delete that stalls on a non-empty bucket is
+                # recoverable; emptying a Retain bucket is not.
+                message = (
+                    f"Skipping pre-clean of {stack_name}: could not determine which resources "
+                    f"are retained ({e}). Empty any leftover buckets manually if the delete stalls."
+                )
+                logging.warning(message)
+                if on_event:
+                    on_event(message)
+                return
+
+            response = self.cf_client.describe_stack_resources(StackName=stack_name)
+            for resource in response.get("StackResources", []):
+                physical_id = resource.get("PhysicalResourceId")
+                logical_id = resource.get("LogicalResourceId", "")
+                if not physical_id:
+                    continue
+                if logical_id in retained_logical_ids:
+                    continue
+                rtype = resource["ResourceType"]
+                if rtype == "AWS::S3::Bucket":
+                    if on_event:
+                        on_event(f"Emptying bucket {physical_id}...")
+                    self._empty_bucket(physical_id)
+                elif rtype == "AWS::Athena::WorkGroup":
+                    if on_event:
+                        on_event(f"Cleaning workgroup {physical_id}...")
+                    self._clean_athena_workgroup(physical_id)
+        except ClientError as e:
+            logging.debug(f"Could not pre-clean stack {stack_name}: {e}")
+
+    def _empty_bucket(self, bucket_name: str) -> None:
+        """Delete all objects and versions from an S3 bucket (1000 per batch)."""
+        import logging
+
+        try:
+            paginator = self.s3_client.get_paginator("list_object_versions")
+            for page in paginator.paginate(Bucket=bucket_name):
+                objects = []
+                for v in page.get("Versions", []):
+                    objects.append({"Key": v["Key"], "VersionId": v["VersionId"]})
+                for dm in page.get("DeleteMarkers", []):
+                    objects.append({"Key": dm["Key"], "VersionId": dm["VersionId"]})
+                for i in range(0, len(objects), 1000):
+                    batch = objects[i : i + 1000]
+                    self.s3_client.delete_objects(
+                        Bucket=bucket_name,
+                        Delete={"Objects": batch, "Quiet": True},
+                    )
+        except ClientError as e:
+            logging.debug(f"Could not empty bucket {bucket_name}: {e}")
+
+    def _clean_athena_workgroup(self, workgroup_name: str) -> None:
+        """Force-delete an Athena workgroup and all its contents."""
+        import logging
+
+        try:
+            athena = self.session.client("athena")
+            athena.delete_work_group(WorkGroup=workgroup_name, RecursiveDeleteOption=True)
+        except ClientError as e:
+            logging.debug(f"Could not clean Athena workgroup {workgroup_name}: {e}")
+
     def package_template(
         self, template_path: str | Path, s3_bucket: str, s3_prefix: str = None, on_event: Callable = None
     ) -> str:
@@ -299,7 +434,7 @@ class CloudFormationManager:
         template_path = Path(template_path)
 
         # Read template
-        with open(template_path) as f:
+        with open(template_path, encoding="utf-8") as f:
             template_body = f.read()
 
         # Parse template using cfn-flip for CloudFormation compatibility
@@ -382,9 +517,9 @@ class CloudFormationManager:
                                 resource["Properties"]["TemplateURL"] = f"https://{s3_bucket}.{s3_domain}/{s3_key}"
                             except Exception:
                                 # Fallback to path-style URL which works across partitions
-                                resource["Properties"][
-                                    "TemplateURL"
-                                ] = f"https://s3.{self.region}.amazonaws.com/{s3_bucket}/{s3_key}"
+                                resource["Properties"]["TemplateURL"] = (
+                                    f"https://s3.{self.region}.amazonaws.com/{s3_bucket}/{s3_key}"
+                                )
 
         # Return packaged template as YAML with CloudFormation intrinsic functions preserved
         return cfn_flip.dump_yaml(template)
@@ -454,7 +589,7 @@ class CloudFormationManager:
     def _read_template(self, template_path: str | Path) -> str:
         """Read and return template content."""
         template_path = Path(template_path)
-        with open(template_path) as f:
+        with open(template_path, encoding="utf-8") as f:
             content = f.read()
         return content
 

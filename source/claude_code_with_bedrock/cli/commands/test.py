@@ -171,7 +171,7 @@ class TestCommand(Command):
         console.print("✓ Found config.json")
 
         # Read and display config details
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             pkg_config = json.load(f)
             # Try to read from the specified profile name, fall back to "ClaudeCode" for backward compatibility
             profile_config = pkg_config.get(test_profile_name) or pkg_config.get("ClaudeCode", {})
@@ -184,6 +184,18 @@ class TestCommand(Command):
             # Display configuration
             console.print("\n[bold]Configuration:[/bold]")
             console.print(f"[dim]  - Provider: {profile_config.get('provider_domain', 'unknown')}[/dim]")
+
+            # Display Azure AD authentication mode if applicable
+            if profile_config.get("provider_type") == "azure":
+                azure_auth_mode = profile_config.get("azure_auth_mode", "public")
+                if azure_auth_mode == "certificate":
+                    auth_mode_display = "Certificate (confidential client)"
+                elif azure_auth_mode == "secret":
+                    auth_mode_display = "Client Secret (confidential client — secret in OS keyring)"
+                else:
+                    auth_mode_display = "Public client"
+                console.print(f"[dim]  - Azure Auth Mode: {auth_mode_display}[/dim]")
+
             console.print(f"[dim]  - AWS Region: {profile_config.get('aws_region', 'unknown')}[/dim]")
 
             # Check credential storage
@@ -220,7 +232,12 @@ class TestCommand(Command):
 
             # Set up temporary AWS profile for testing
             test_profile = f"ccwb-test-{uuid.uuid4().hex[:8]}"
-            credential_command = f"/bin/sh -c 'CCWB_PROFILE={test_profile_name} {credential_binary}'"
+            # Pass the profile via --profile flag (cross-platform, no shell wrapper).
+            # The binary also reads CCWB_PROFILE, but a POSIX shell wrapper does not
+            # exist on Windows, so the --profile flag is used instead.
+            # Quote the binary path so a space in it survives botocore's shell split
+            # (shlex on POSIX); the profile name is validated to [A-Za-z0-9-] so needs none.
+            credential_command = f'"{credential_binary}" --profile {test_profile_name}'
             subprocess.run(
                 ["aws", "configure", "set", f"profile.{test_profile}.credential_process", credential_command],
                 capture_output=True,
@@ -259,9 +276,12 @@ class TestCommand(Command):
         console.print(f"[dim]Using temporary profile: {test_profile}[/dim]")
 
         # Configure the test profile
-        # Set environment variable to tell credential binary which profile to use from config.json
-        # Use shell to set environment variable
-        credential_command = f"/bin/sh -c 'CCWB_PROFILE={test_profile_name} {credential_binary}'"
+        # Pass the profile via --profile flag (cross-platform, no shell wrapper).
+        # The binary also reads CCWB_PROFILE, but a POSIX shell wrapper does not
+        # exist on Windows, so the --profile flag is used instead.
+        # Quote the binary path so a space in it survives botocore's shell split
+        # (shlex on POSIX); the profile name is validated to [A-Za-z0-9-] so needs none.
+        credential_command = f'"{credential_binary}" --profile {test_profile_name}'
         aws_config_result = subprocess.run(
             ["aws", "configure", "set", f"profile.{test_profile}.credential_process", credential_command],
             capture_output=True,
@@ -361,7 +381,7 @@ class TestCommand(Command):
                 # Test Bedrock access in configured region(s)
                 for region in regions_to_test:
                     task = progress.add_task(f"Testing Bedrock API in {region}...", total=None)
-                    result = self._test_bedrock_access(aws_profile, region, with_api)
+                    result = self._test_bedrock_access(aws_profile, region, with_api, profile.selected_model)
                     test_results.append((f"Bedrock - {region}", result["status"], result["details"]))
                     progress.update(task, completed=True)
 
@@ -394,6 +414,14 @@ class TestCommand(Command):
                 else:
                     test_results.append(("Quota Monitoring", "-", "Skipped (not enabled)"))
 
+                # Test 7: Local collector sidecar (sidecar mode only)
+                monitoring_mode = getattr(profile, "monitoring_mode", "central")
+                if profile.monitoring_enabled and monitoring_mode == "sidecar":
+                    task = progress.add_task("Testing local collector sidecar...", total=None)
+                    result = self._test_local_collector(package_dir)
+                    test_results.append(("Local Collector", result["status"], result["details"]))
+                    progress.update(task, completed=True)
+
         # Display results
         console.print("\n")
         for test_name, status, details in test_results:
@@ -423,7 +451,17 @@ class TestCommand(Command):
         if failed > 0:
             console.print("\n[red]Some tests failed. Please check the details above.[/red]")
             console.print("\n[bold]Troubleshooting tips:[/bold]")
-            console.print("• Ensure you have access to the Okta application")
+            provider_type = getattr(profile, "provider_type", None)
+            provider_labels = {
+                "okta": "Okta",
+                "azure": "Microsoft Entra ID (Azure AD)",
+                "auth0": "Auth0",
+                "cognito": "AWS Cognito",
+            }
+            provider_label = provider_labels.get(
+                provider_type, provider_type.title() if provider_type else "your identity provider"
+            )
+            console.print(f"• Ensure you have access to the {provider_label} application")
             console.print("• Check that the Cognito Identity Pool is deployed")
             console.print("• Verify IAM roles have correct permissions")
             console.print("• Make sure Bedrock is enabled in your AWS account")
@@ -472,7 +510,7 @@ class TestCommand(Command):
             if not aws_config_file.exists():
                 return {"status": "✗", "details": "AWS config file not found"}
 
-            with open(aws_config_file) as f:
+            with open(aws_config_file, encoding="utf-8") as f:
                 content = f.read()
                 if f"[profile {profile_name}]" in content:
                     return {"status": "✓", "details": f"Profile '{profile_name}' found"}
@@ -571,7 +609,9 @@ class TestCommand(Command):
         except Exception as e:
             return {"status": "✗", "details": str(e)}
 
-    def _test_bedrock_access(self, profile_name: str, region: str, with_api: bool = False) -> dict:
+    def _test_bedrock_access(
+        self, profile_name: str, region: str, with_api: bool = False, selected_model: str = None
+    ) -> dict:
         """Test Bedrock access in a specific region."""
         try:
             # Clear AWS credentials from environment
@@ -614,8 +654,8 @@ class TestCommand(Command):
                 models = json.loads(result.stdout)
                 if models:
                     if with_api:
-                        # Test actual model invocation with one of the available models
-                        test_result = self._test_model_invocation(profile_name, region, models)
+                        # Test model invocation using the configured inference profile
+                        test_result = self._test_model_invocation(profile_name, region, selected_model)
                         if test_result["success"]:
                             return {"status": "✓", "details": f"Found {len(models)} models, API test passed"}
                         else:
@@ -788,13 +828,54 @@ class TestCommand(Command):
         except Exception as e:
             return {"status": "✗", "details": str(e)[:50]}
 
+    def _test_local_collector(self, package_dir: Path) -> dict:
+        """Test that the local OTEL collector sidecar binary is present and can start."""
+        import platform as platform_mod
+        import time
+
+        system = platform_mod.system().lower()
+        arch = platform_mod.machine().lower()
+
+        # Determine expected binary name
+        if system == "darwin":
+            suffix = "macos-arm64" if arch == "arm64" else "macos-intel"
+        elif system == "windows":
+            suffix = "windows.exe"
+        else:
+            suffix = "linux-arm64" if arch in ["arm64", "aarch64"] else "linux-x64"
+
+        binary = package_dir / f"otelcol-{suffix}"
+        if not binary.exists():
+            return {"status": "✗", "details": f"Collector binary not found: otelcol-{suffix}"}
+
+        config = package_dir / "collector-config.yaml"
+        if not config.exists():
+            return {"status": "✗", "details": "collector-config.yaml not found in package"}
+
+        # Try starting the collector briefly to verify it's functional
+        try:
+            proc = subprocess.Popen(
+                [str(binary), "--config", str(config)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            time.sleep(2)
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().decode()[:100]
+                return {"status": "✗", "details": f"Collector exited immediately: {stderr}"}
+            proc.terminate()
+            proc.wait(timeout=5)
+            return {"status": "✓", "details": f"Collector binary OK ({binary.name})"}
+        except Exception as e:
+            return {"status": "✗", "details": str(e)[:80]}
+
     def _get_package_profile_name(self, package_dir: Path) -> str | None:
         """Get the profile name from the package's config.json."""
         config_file = package_dir / "config.json"
         if not config_file.exists():
             return None
         try:
-            with open(config_file) as f:
+            with open(config_file, encoding="utf-8") as f:
                 config = json.load(f)
             # config.json has profile names as top-level keys
             # Return the first (usually only) profile
@@ -863,8 +944,15 @@ class TestCommand(Command):
         except Exception as e:
             return {"status": "✗", "details": str(e)[:50]}
 
-    def _test_model_invocation(self, profile_name: str, region: str, available_models: list = None) -> dict:
-        """Test actual model invocation with Claude 3."""
+    @staticmethod
+    def _get_fallback_test_model() -> str:
+        """Get a fallback test model using the cheapest available model."""
+        from claude_code_with_bedrock.models import resolve_model_for_tier
+
+        return resolve_model_for_tier("haiku", "us") or "anthropic.claude-haiku-4-5-20251001-v1:0"
+
+    def _test_model_invocation(self, profile_name: str, region: str, selected_model: str = None) -> dict:
+        """Test actual model invocation using the configured inference profile."""
         try:
             # Clear AWS credentials from environment
             import os
@@ -873,44 +961,19 @@ class TestCommand(Command):
             test_env.pop("AWS_ACCESS_KEY_ID", None)
             test_env.pop("AWS_SECRET_ACCESS_KEY", None)
             test_env.pop("AWS_SESSION_TOKEN", None)
-            # Pick a model to test - prefer Claude 3 Sonnet, but use what's available
-            if available_models:
-                # Prefer these models in order
-                preferred_models = [
-                    "anthropic.claude-3-sonnet-20240229-v1:0",
-                    "anthropic.claude-3-haiku-20240307-v1:0",
-                    "anthropic.claude-instant-v1",
-                ]
 
-                model_id = None
-                for preferred in preferred_models:
-                    if preferred in available_models:
-                        model_id = preferred
-                        break
+            if not selected_model:
+                return {"success": False, "error": "No model configured - run 'ccwb init' to select a model"}
 
-                # If none of our preferred models are available, use the first available Claude model
-                if not model_id and available_models:
-                    model_id = available_models[0]
-            else:
-                # Fallback if no models list provided
-                model_id = "anthropic.claude-3-sonnet-20240229-v1:0"
+            model_id = selected_model
 
-            # Create a minimal test prompt
-            if model_id and "claude-instant" in model_id:
-                # Claude Instant v1 uses the older text completions API
-                body_dict = {
-                    "prompt": "\n\nHuman: Say 'test successful' in exactly 2 words\n\nAssistant:",
-                    "max_tokens_to_sample": 10,
-                    "temperature": 0,
-                }
-            else:
-                # Claude 2 and 3 use Messages API
-                body_dict = {
-                    "messages": [{"role": "user", "content": "Say 'test successful' in exactly 2 words"}],
-                    "max_tokens": 10,
-                    "temperature": 0,
-                    "anthropic_version": "bedrock-2023-05-31",
-                }
+            # Create a minimal test prompt using Messages API
+            body_dict = {
+                "messages": [{"role": "user", "content": "Say 'test successful' in exactly 2 words"}],
+                "max_tokens": 10,
+                "temperature": 0,
+                "anthropic_version": "bedrock-2023-05-31",
+            }
 
             # Write body to a temporary file
             import tempfile
@@ -942,16 +1005,10 @@ class TestCommand(Command):
             if result.returncode == 0:
                 # Check if we got a response
                 try:
-                    with open("/tmp/bedrock-test-output.json") as f:
+                    with open("/tmp/bedrock-test-output.json", encoding="utf-8") as f:
                         response = json.load(f)
-                        # Different response formats for different models
                         if "content" in response and len(response["content"]) > 0:
-                            # Messages API response (Claude 2/3)
                             text = response["content"][0].get("text", "").strip()
-                            return {"success": True, "response": text}
-                        elif "completion" in response:
-                            # Text completions API response (Claude Instant v1)
-                            text = response["completion"].strip()
                             return {"success": True, "response": text}
                         else:
                             return {"success": False, "error": "No content in response"}
@@ -987,6 +1044,10 @@ class TestCommand(Command):
     def _get_expected_account(self, config_profile) -> str:
         """Get the expected AWS account ID from the deployed stack."""
         try:
+            # Skip auth stack lookup when SSO is disabled
+            if not getattr(config_profile, "sso_enabled", True):
+                return None
+
             # Try to get account ID from the auth stack
             stack_name = config_profile.stack_names.get("auth", f"{config_profile.identity_pool_name}-stack")
 
@@ -1064,7 +1125,7 @@ class TestCommand(Command):
 
             # Test 1: Create user policy
             try:
-                policy = manager.create_policy(
+                manager.create_policy(
                     policy_type=PolicyType.USER,
                     identifier=test_email,
                     monthly_token_limit=1000000,
@@ -1091,7 +1152,9 @@ class TestCommand(Command):
             try:
                 resolved = manager.resolve_quota_for_user(test_email, groups=None)
                 if resolved and resolved.identifier == test_email:
-                    results.append({"name": "Resolve Quota", "status": "✓", "details": "User policy correctly resolved"})
+                    results.append(
+                        {"name": "Resolve Quota", "status": "✓", "details": "User policy correctly resolved"}
+                    )
                 else:
                     results.append(
                         {"name": "Resolve Quota", "status": "!", "details": "Policy resolved but not user-specific"}
@@ -1181,31 +1244,7 @@ class TestCommand(Command):
         except Exception:
             return None
 
-    def _invoke_metrics_aggregator(self, profile) -> dict:
-        """Force-invoke the metrics aggregator Lambda."""
-        try:
-            lambda_client = boto3.client("lambda", region_name=profile.aws_region)
-
-            # Lambda name is fixed (deployed by monitoring stack)
-            function_name = "ClaudeCode-MetricsAggregator"
-
-            response = lambda_client.invoke(
-                FunctionName=function_name,
-                InvocationType="RequestResponse",
-                Payload=b"{}",
-            )
-
-            if response["StatusCode"] == 200:
-                return {"name": "Aggregator Lambda", "status": "✓", "details": "Invoked successfully"}
-            else:
-                return {"name": "Aggregator Lambda", "status": "✗", "details": f"Status: {response['StatusCode']}"}
-
-        except lambda_client.exceptions.ResourceNotFoundException:
-            return {"name": "Aggregator Lambda", "status": "✗", "details": "Lambda function not found"}
-        except Exception as e:
-            return {"name": "Aggregator Lambda", "status": "✗", "details": str(e)[:60]}
-
-    def _make_quota_test_bedrock_call(self, aws_profile: str, region: str) -> dict:
+    def _make_quota_test_bedrock_call(self, aws_profile: str, region: str, selected_model: str = None) -> dict:
         """Make a small Bedrock call for testing usage capture."""
         import os
         import tempfile
@@ -1237,7 +1276,7 @@ class TestCommand(Command):
                         "bedrock-runtime",
                         "invoke-model",
                         "--model-id",
-                        "anthropic.claude-3-haiku-20240307-v1:0",
+                        selected_model or self._get_fallback_test_model(),
                         "--body",
                         f"fileb://{body_file}",
                         "--content-type",
@@ -1255,7 +1294,8 @@ class TestCommand(Command):
                 )
 
                 if result.returncode == 0:
-                    return {"name": "Test Bedrock Call", "status": "✓", "details": "Haiku responded"}
+                    model_short = (selected_model or "haiku-4.5").split(".")[-1][:30]
+                    return {"name": "Test Bedrock Call", "status": "✓", "details": f"{model_short} responded"}
                 else:
                     return {"name": "Test Bedrock Call", "status": "✗", "details": result.stderr[:80]}
             finally:
@@ -1290,7 +1330,7 @@ class TestCommand(Command):
             )
 
             # Step 2: Make a small Bedrock call
-            bedrock_result = self._make_quota_test_bedrock_call(aws_profile, profile.aws_region)
+            bedrock_result = self._make_quota_test_bedrock_call(aws_profile, profile.aws_region, profile.selected_model)
             if bedrock_result["status"] != "✓":
                 results.append(bedrock_result)
                 return results
@@ -1299,14 +1339,7 @@ class TestCommand(Command):
             # Step 3: Wait for CloudWatch Logs sync
             time.sleep(2)
 
-            # Step 4: Force-invoke metrics aggregator Lambda
-            aggregator_result = self._invoke_metrics_aggregator(profile)
-            if aggregator_result["status"] != "✓":
-                results.append(aggregator_result)
-                return results
-            results.append(aggregator_result)
-
-            # Step 5: Wait for aggregator to complete (it queries logs)
+            # Step 4: Wait for metrics to propagate
             time.sleep(5)
 
             # Step 6: Query usage again
@@ -1349,8 +1382,7 @@ class TestCommand(Command):
 
         console.print(
             Panel.fit(
-                "[bold cyan]Quota Monitoring Tests[/bold cyan]\n\n"
-                f"Testing profile: [bold]{profile_name}[/bold]",
+                f"[bold cyan]Quota Monitoring Tests[/bold cyan]\n\nTesting profile: [bold]{profile_name}[/bold]",
                 border_style="cyan",
                 padding=(1, 2),
             )
@@ -1365,15 +1397,16 @@ class TestCommand(Command):
             test_results.append(result)
             progress.update(task, completed=True)
 
-            # If config is not valid, we can still continue with some tests
-            config_ok = result["status"] == "✓"
+            assert result["status"] == "✓"
 
             # 2. Test quota API endpoint (/check)
             endpoint = endpoint_override or getattr(profile, "quota_api_endpoint", None)
             if endpoint:
                 task = progress.add_task("Testing quota API...", total=None)
                 api_result = self._test_quota_api(credential_binary, endpoint, package_dir, profile_name)
-                test_results.append({"name": "Quota API", "status": api_result["status"], "details": api_result["details"]})
+                test_results.append(
+                    {"name": "Quota API", "status": api_result["status"], "details": api_result["details"]}
+                )
                 progress.update(task, completed=True)
             else:
                 test_results.append({"name": "Quota API", "status": "!", "details": "No endpoint configured"})

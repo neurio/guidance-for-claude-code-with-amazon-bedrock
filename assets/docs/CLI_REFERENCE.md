@@ -28,6 +28,8 @@ This document provides a complete reference for all `ccwb` (Claude Code with Bed
     - [`quota unblock` - Unblock User](#quota-unblock---unblock-user)
     - [`quota export` - Export Policies](#quota-export---export-policies)
     - [`quota import` - Import Policies](#quota-import---import-policies)
+  - [Claude Cowork 3P](#claude-cowork-3p)
+    - [`cowork generate` - Generate MDM Configuration](#cowork-generate---generate-mdm-configuration)
   - [Profile Management](#profile-management)
     - [`context list` - List All Profiles](#context-list---list-all-profiles)
     - [`context current` - Show Active Profile](#context-current---show-active-profile)
@@ -74,6 +76,7 @@ poetry run ccwb init [options]
 **Options:**
 
 - `--profile <name>` - Configuration profile name (optional, will prompt if not specified)
+- `--managed` - Deploy settings to OS-level managed-settings.json (highest precedence, non-overridable by users)
 
 **What it does:**
 
@@ -87,6 +90,7 @@ poetry run ccwb init [options]
 - Configures cross-region inference profiles (US, Europe, APAC)
 - Prompts for source region selection for model inference
 - Sets up monitoring options
+- Prompts for monitoring mode (central collector on ECS Fargate, or sidecar collector running locally on each developer's machine)
 - Configures quota monitoring:
   - Monthly token limit per user
   - Daily token limit with burst buffer (auto-calculated from monthly)
@@ -125,12 +129,14 @@ poetry run ccwb deploy [stack] [options]
 **Stacks deployed:**
 
 1. **auth** - Authentication infrastructure and IAM roles (always required)
-2. **networking** - VPC and networking resources for monitoring (optional)
-3. **monitoring** - OpenTelemetry collector on ECS Fargate (optional)
+2. **networking** - VPC and networking resources for monitoring (central mode only)
+3. **monitoring** - OpenTelemetry collector on ECS Fargate (central mode only)
 4. **dashboard** - CloudWatch dashboard for usage metrics (optional)
-5. **analytics** - Kinesis Firehose and Athena for analytics (optional)
+5. **analytics** - Kinesis Firehose and Athena SQL query pipeline (central mode only, optional)
 6. **quota** - Per-user token quota monitoring and alerts (optional, requires dashboard)
 7. **codebuild** - AWS CodeBuild for Windows binary builds (optional, only if enabled during init)
+
+> **Note**: In sidecar monitoring mode, the auth and dashboard stacks are deployed. The networking, monitoring, and analytics stacks are skipped because the OpenTelemetry collector runs locally on each developer's machine. Both modes include the same PromQL CloudWatch dashboard with full metric analytics.
 
 **Examples:**
 
@@ -233,78 +239,122 @@ poetry run ccwb package [options]
 **Options:**
 
 - `--target-platform <platform>` - Target platform for binary (default: "all")
-  - `macos` - Build for current macOS architecture
-  - `macos-arm64` - Build for Apple Silicon Macs
-  - `macos-intel` - Build for Intel Macs (uses Rosetta on ARM Macs)
-  - `linux` - Build for Linux (native, current architecture)
-  - `linux-x64` - Build for Linux x64 using Docker
-  - `linux-arm64` - Build for Linux ARM64 using Docker
-  - `windows` - Build for Windows (uses CodeBuild - requires enabling during init)
-  - `all` - Build for all available platforms
+  - `macos-arm64` - Apple Silicon Macs (M1/M2/M3/M4)
+  - `macos-intel` - Intel Macs
+  - `linux-x64` - Linux x86-64
+  - `linux-arm64` - Linux ARM64 (Graviton, etc.)
+  - `windows` - Windows x64
+  - `all` - All 5 platforms
+- `--go` - Cross-compile Go binaries locally (requires Go 1.24+ installed)
 - `--distribute` - Upload package and generate distribution URL
 - `--expires-hours <hours>` - Distribution URL expiration in hours (with --distribute) [default: "48"]
-- `--profile <name>` - Configuration profile to use [default: "default"]
+- `--profile <name>` - Configuration profile to use [default: active profile]
+- `--regenerate-installers` - Regenerate config and install scripts using existing binaries from latest dist
 
 **What it does:**
 
-- Builds Nuitka executable from authentication code
-- Creates configuration file with:
-  - OIDC provider settings
-  - Identity Pool ID from deployed stack
-  - Credential storage method (keyring or session)
-  - Selected Claude model and cross-region profile
-  - Source region for model inference
-- Generates installer script (install.sh for Unix, install.bat for Windows)
-- Creates user documentation
-- Optionally uploads to S3 and generates presigned URL (with --distribute)
+1. Cross-compiles native Go binaries for all selected platforms (with `--go`)
+2. Creates `config.json` with federation config read from the admin profile
+3. Creates `claude-settings/settings.json` with Bedrock model and OTel endpoint (or `managed-settings.json` if `--managed` was used during init)
+4. Creates installer scripts (`install.sh`, `install.bat`, `ccwb-install.ps1`)
+5. Outputs to `dist/{profile}/{timestamp}/`
 
-**Platform Support (Hybrid Build System):**
+**Build Modes:**
+
+| Mode | Flag | Requirements | Best for |
+|---|---|---|---|
+| **Go cross-compile** (recommended) | `--go` | Go 1.24+ installed | All admins — fast, all platforms from one machine |
+| **Legacy** | (default) | PyInstaller, Docker, CodeBuild | Backward compatibility with Python binaries |
+
+**Platform Support (Go Cross-Compilation):**
+
+With `--go`, all 5 platforms are always available regardless of the admin's OS. No Docker, CodeBuild, x86 venvs, or platform-specific toolchains needed.
+
+- **macOS ARM64**: Native Apple Silicon binary (~9 MB)
+- **macOS Intel**: Native x86-64 binary (~10 MB)
+- **Linux x64**: Statically linked, works on any distro (~10 MB)
+- **Linux ARM64**: Statically linked for Graviton/ARM (~9 MB)
+- **Windows x64**: Native PE with embedded version info (~14 MB, unstripped for Defender compatibility)
+
+**Offline Packaging:**
+
+`ccwb package` normally needs internet on the admin machine for three things: Go module downloads for `source/go`, the OCB (OpenTelemetry Collector Builder) binary from GitHub, and Go module downloads for the OCB-generated collector module (sidecar mode only). A `vendor/` directory cannot cover the collector build — OCB generates a fresh Go module in a temp directory on every run.
+
+For air-gapped environments, use `--prepare-offline` to pre-seed everything:
+
+```bash
+# On an internet-connected machine (same OS/arch and Go version as the offline box):
+poetry run ccwb package --prepare-offline
+# Transfer ccwb-offline-go-bundle.tar.gz to the offline machine, extract, then:
+tar xzf ccwb-offline-go-bundle.tar.gz
+./scripts/prepare-offline-go-bundle.sh install
+source ccwb-offline-go-bundle/offline-env.sh
+poetry run ccwb package
+```
+
+The bundle contains the pinned OCB binary (installed to `~/.cache/ocb/`, where `package.py` looks before downloading) and a pre-populated Go module cache covering both `source/go` and the collector. Because every `go`/`ocb` subprocess inherits the environment, `GOPROXY=off` plus the seeded `GOMODCACHE` satisfies all module resolution — including the `go mod tidy` OCB runs internally. The `prepare` step rehearses a fully offline collector build before archiving, so a bundle that ships is a bundle that works.
+
+**Legacy mode platform details (PyInstaller / Nuitka / Docker):**
+
+PyInstaller is a runtime bundler, not a cross-OS compiler. It emits binaries in the host OS's native format (Mach-O on macOS, ELF on Linux). That constrains which targets each build host can produce:
+
+| Target binary | Build host required | Tooling |
+|---|---|---|
+| `macos-arm64`, `macos-intel` | **macOS** | PyInstaller (native) |
+| `linux-x64`, `linux-arm64` | Linux, **or** macOS with Docker Desktop | PyInstaller (Docker container when building from macOS) |
+| `windows` | any host | AWS CodeBuild (remote) |
+
+> **Linux admins cannot build macOS binaries.** There is no supported path for producing Mach-O binaries on Linux — Apple's platform design makes this infeasible. If `ccwb package` detects a macOS target on a non-macOS host, the build refuses with a clear error rather than silently producing an ELF binary labeled as macOS (which would fail on end-user Macs with `exec format error`).
+>
+> To produce macOS binaries, use a macOS workstation, a CI macOS runner (GitHub Actions `macos-latest`, AWS CodeBuild macOS project, or a self-hosted Mac runner), or an EC2 Mac instance, and collect the artifacts from there.
 
 - **macOS**: Uses PyInstaller with architecture-specific builds
-  - ARM64: Native build on Apple Silicon Macs (works on all Macs)
-  - Intel: **Optional** - requires x86_64 Python environment on ARM Macs
-  - Universal: Requires both architectures' Python libraries (not currently automated)
-- **Linux**: Uses PyInstaller in Docker containers
+  - ARM64: Native build on Apple Silicon Macs only — cannot run on Intel Macs
+  - Intel: Runs natively on Intel Macs and on Apple Silicon via Rosetta — covers all Mac users with one binary
+  - Cross-arch: **Optional** — build the other architecture from your current Mac; requires a universal2 Python (see below)
+- **Linux**: Uses PyInstaller in Docker containers (cross-compiled from macOS host)
   - x64: Uses linux/amd64 Docker platform
   - ARM64: Uses linux/arm64 Docker platform
   - Docker Desktop handles architecture emulation automatically
+  - **Requires Docker Desktop to be installed and running** — see Graceful Fallback Behavior below
+  - On a Linux host, PyInstaller runs natively — Docker is not required
 - **Windows**: Uses Nuitka via AWS CodeBuild (if enabled during init)
   - Automated builds take 12-15 minutes
   - Requires CodeBuild to be enabled during `init`
   - Will be skipped if CodeBuild is not enabled
 
-**Intel Mac Build Setup (Optional):**
+**Cross-arch macOS Build Setup (legacy mode only, optional):**
 
-To enable Intel builds on Apple Silicon Macs (optional):
+By default, legacy-mode `ccwb package` builds a binary for your Mac's own architecture. The Intel (`macos-intel`) binary covers all Mac users — it runs natively on Intel Macs and via Rosetta on Apple Silicon — so an Apple Silicon admin who needs to support Intel Mac users should build the Intel binary using this setup.
 
-```bash
-# Step 1: Install x86_64 Homebrew (if not already installed)
-arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+To build for the other architecture (e.g. Intel binary on Apple Silicon, or ARM64 binary on Intel), install a universal2 Python:
 
-# Step 2: Install x86_64 Python
-arch -x86_64 /usr/local/bin/brew install python@3.12
+1. Download the **macOS 64-bit universal2 installer** for Python 3.12 from [python.org/downloads/macos](https://www.python.org/downloads/macos/)
+2. Run the installer — it places Python at `/Library/Frameworks/Python.framework/`
+3. Re-run `ccwb package` — it detects the universal2 Python automatically
 
-# Step 3: Create x86_64 virtual environment
-arch -x86_64 /usr/local/bin/python3.12 -m venv ~/venv-x86
+`ccwb` creates an isolated per-arch build environment at `~/.ccwb/build-venvs/` on first cross-arch build (~30s). Subsequent runs reuse it.
 
-# Step 4: Install required packages
-arch -x86_64 ~/venv-x86/bin/pip install pyinstaller boto3 keyring
-```
+(With `--go`, cross-arch builds are unnecessary — Go cross-compiles all platforms natively.)
 
-**Behavior when Intel environment is not set up:**
+**Behavior when universal2 Python is not installed:**
 
-- For `--target-platform=all`: Skips Intel builds with a note, builds all other platforms
-- For `--target-platform=macos-intel`: Shows instructions for optional setup, skips the build
-- The package process continues successfully without Intel binaries
-- ARM64 binaries can be distributed to all Mac users (Intel and Apple Silicon)
+- For `--target-platform=all`: Skips the cross-arch target with a note, builds all other platforms normally
+- For an explicit cross-arch target (e.g. `--target-platform=macos-intel` on Apple Silicon): Fails with a clear error pointing to the python.org installer
+- The package process continues successfully without cross-arch binaries
+- Note: Intel (`macos-intel`) binaries run natively on Intel Macs and via Rosetta on Apple Silicon — they cover all Mac users. ARM64 binaries only run on Apple Silicon and cannot run on Intel Macs.
 
-**Graceful Fallback Behavior:**
+**Graceful Fallback Behavior (legacy mode):**
 
 The package command is designed to handle missing optional components gracefully:
 
-- **Intel Mac builds**: Skipped if x86_64 Python environment is not available on ARM Macs
+- **Cross-arch macOS builds**: Skipped if universal2 Python is not installed (see Cross-arch macOS Build Setup above)
 - **Windows builds**: Skipped if CodeBuild was not enabled during `init`
-- **Linux builds**: Skipped if Docker is not available
+- **Linux builds (from macOS)**: Skipped with a warning in two cases:
+  - Docker is not installed (`docker` binary not found in `$PATH`) — install Docker Desktop from https://docs.docker.com/get-docker/
+  - Docker is installed but the daemon is not running — open Docker Desktop and wait for it to start, then retry
+  - macOS and Windows builds are **unaffected** by Docker availability
+- **macOS builds (from non-macOS host)**: Refused with a clear error explaining that PyInstaller cannot cross-compile and listing alternative paths (macOS workstation, CI runner, EC2 Mac). Other targets in the same `ccwb package` invocation continue to build normally.
 - **At least one platform must build successfully** for the package command to succeed
 
 This ensures that packaging always works, even if some optional platforms are not available.
@@ -320,10 +370,54 @@ This ensures that packaging always works, even if some optional platforms are no
 - `otel-helper-<platform>` - OTEL helper (if monitoring enabled)
 - `config.json` - Configuration
 - `install.sh` - Unix installer script (auto-detects architecture)
-- `install.bat` - Windows installer script
+- `install.bat` - Windows installer launcher
+- `ccwb-install.ps1` - Windows PowerShell installer logic (called by install.bat)
 - `README.md` - Installation instructions
 - Includes Claude Code telemetry settings (if monitoring enabled)
 - Configures environment variables for model selection (ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_HAIKU_MODEL)
+
+**Credential process binary flags (for end users):**
+
+The distributed `credential-process` binary accepts the following flags directly:
+
+| Flag | Description |
+|---|---|
+| `--profile, -p <name>` | Profile to use (default: `ClaudeCode`, or `$CCWB_PROFILE`) |
+| `--clear-cache` | Clear cached credentials and force re-authentication |
+| `--check-expiration` | Exit 0 if credentials valid, 1 if expired |
+| `--refresh-if-needed` | Refresh credentials if expired (session storage mode only) |
+| `--get-monitoring-token` | Return cached OIDC monitoring token |
+| `--set-client-secret` | Store Azure AD client secret in OS secure storage. Uses an interactive prompt by default; set `CCWB_CLIENT_SECRET` env var for non-interactive use. Press Enter at the prompt (or set the env var to an empty string) to clear the stored secret. |
+
+**`--set-client-secret` usage examples:**
+
+```bash
+# Interactive (prompts for secret):
+~/claude-code-with-bedrock/credential-process --set-client-secret --profile ClaudeCode
+
+# Non-interactive (MDM/scripted deployment) — avoids secret appearing in shell history:
+CCWB_CLIENT_SECRET=<your-client-secret> ~/claude-code-with-bedrock/credential-process --set-client-secret --profile ClaudeCode
+
+# Clear a stored secret:
+~/claude-code-with-bedrock/credential-process --set-client-secret --profile ClaudeCode
+# (press Enter without typing a value)
+```
+
+**Certificate path environment variables (confidential client — certificate mode):**
+
+When certificate paths recorded in `config.json` are absolute, they may not resolve on end-user machines with a different install layout. Set these env vars to override the paths stored in `config.json` at runtime:
+
+| Environment variable | Description |
+|---|---|
+| `AZURE_CLIENT_CERTIFICATE_PATH` | Path to the PEM certificate file. Overrides `client_certificate_path` in `config.json`. |
+| `AZURE_CLIENT_CERTIFICATE_KEY_PATH` | Path to the PEM private key file. Overrides `client_certificate_key_path` in `config.json`. |
+
+```bash
+# Override certificate paths (e.g. via MDM launch agent environment):
+AZURE_CLIENT_CERTIFICATE_PATH=~/certs/cert.pem \
+AZURE_CLIENT_CERTIFICATE_KEY_PATH=~/certs/key.pem \
+~/claude-code-with-bedrock/credential-process --profile ClaudeCode
+```
 
 **Output structure:**
 
@@ -341,7 +435,8 @@ dist/
 ├── otel-helper-windows.exe           # Windows OTEL helper
 ├── config.json                       # Configuration
 ├── install.sh                        # Unix installer (auto-detects architecture)
-├── install.bat                       # Windows installer
+├── install.bat                       # Windows installer launcher
+├── ccwb-install.ps1                  # Windows PowerShell installer logic
 ├── README.md                         # User instructions
 └── .claude/
     └── settings.json                 # Telemetry settings (optional)
@@ -515,6 +610,7 @@ poetry run ccwb status [options]
 - Checks CloudFormation stack status
 - Displays Identity Pool information
 - Shows monitoring configuration and endpoints
+- In sidecar monitoring mode, shows local collector status (running/stopped) and the local OTLP endpoint
 
 ### `cleanup` - Remove Installed Components
 
@@ -541,6 +637,56 @@ poetry run ccwb cleanup [options]
 - Clean up after testing
 - Remove failed installations
 - Start fresh with a new configuration
+
+## Claude Cowork 3P
+
+### `cowork generate` - Generate MDM Configuration
+
+Generate Claude Cowork 3P MDM configuration files for deploying Claude Desktop with Amazon Bedrock as the inference backend.
+
+This command reads your existing deployment profile (region, model, monitoring stack) and generates ready-to-deploy MDM configuration files.
+
+```bash
+# Generate all formats (JSON, macOS .mobileconfig, Windows .reg)
+poetry run ccwb cowork generate
+
+# Generate specific format
+poetry run ccwb cowork generate --format mobileconfig
+poetry run ccwb cowork generate --format reg
+poetry run ccwb cowork generate --format json
+
+# Custom model aliases
+poetry run ccwb cowork generate --models opus,sonnet,haiku
+
+# Custom output directory
+poetry run ccwb cowork generate -o ./my-mdm-configs/
+
+# Specific profile
+poetry run ccwb cowork generate --profile Production
+```
+
+**Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--profile` | Configuration profile to use | Active profile |
+| `--output`, `-o` | Output directory | `dist/cowork-3p/` |
+| `--format`, `-f` | Output format: `all`, `json`, `mobileconfig`, `reg` | `all` |
+| `--models`, `-m` | Comma-separated model aliases | Auto-detected from profile |
+
+**Generated files:**
+
+| File | Platform | Description |
+|------|----------|-------------|
+| `cowork-3p-config.json` | All | Raw MDM configuration JSON (for Claude Desktop Setup UI import) |
+| `cowork-3p.mobileconfig` | macOS | MDM configuration profile (deploy via Jamf, Kandji, Mosyle) |
+| `cowork-3p.reg` | Windows | Registry file (deploy via Group Policy, Intune, SCCM) |
+
+**Automatic integration with `ccwb package`:**
+
+CoWork 3P configs are also auto-generated during `ccwb package` when enabled via `ccwb init`. Both paths use the same shared configuration logic to ensure identical output.
+
+See [CoWork 3P Guide](COWORK_3P.md) for detailed setup and deployment instructions.
 
 ## Quota Management
 
@@ -1043,7 +1189,7 @@ poetry run ccwb destroy [stack] [options]
 
 **Arguments:**
 
-- `stack` - Specific stack to destroy: auth, networking, monitoring, dashboard, or analytics (optional)
+- `stack` - Specific stack to destroy: codebuild, analytics, quota, cowork-dashboard, dashboard, monitoring, distribution, networking, s3bucket, or auth (optional)
 
 **Options:**
 
@@ -1052,8 +1198,56 @@ poetry run ccwb destroy [stack] [options]
 
 **What it does:**
 
-- Deletes CloudFormation stacks in reverse order (analytics → dashboard → monitoring → networking → auth)
+- Deletes CloudFormation stacks in reverse dependency order (codebuild → analytics → quota → cowork-dashboard → dashboard → monitoring → distribution → networking → s3bucket → auth), skipping any not enabled for the profile
 - Shows resources to be deleted before proceeding
 - Warns about manual cleanup requirements (e.g., CloudWatch LogGroups)
 
 **Note:** Some resources like CloudWatch LogGroups may require manual deletion.
+
+### `doctor` - Validate Installation Health
+
+Runs health checks on the local machine to catch misconfigurations and aid troubleshooting.
+
+```bash
+poetry run ccwb doctor [options]
+```
+
+**Options:**
+
+- `--verbose` / `-v` - Show raw JSON from `credential-process --explain` and `otel-helper --status`
+- `--live` / `-l` - Also attempt authentication and check proxy connectivity
+- `--json` - Machine-readable JSON output (for CI or support)
+- `--profile <name>` - Check a specific profile
+
+**Health Checks:**
+
+| Check | What it validates |
+|-------|-------------------|
+| `credential-process` | Binary exists in install dir (.exe/.cmd/.ps1 on Windows) |
+| `config.json` | Present, valid JSON, lists profiles |
+| `aws-profile` | `~/.aws/config` references credential-process |
+| `settings.json` | Claude Code settings file with env/hooks |
+| `explain` | Calls `credential-process --explain` — shows resolved auth mode, provider, quota |
+| `otel-helper` | Telemetry binary exists (only FAIL if monitoring configured) |
+| `otel-status` | Calls `otel-helper --status` — proxy running? headers cached? |
+| `auth-test` | (--live only) Attempts credential check |
+| `proxy-health` | (--live only) TCP connect to OTEL proxy port |
+
+**On failure:** Generates a pre-filled GitHub issue URL with diagnostics, environment, and auth mode.
+
+### Go Binary Diagnostic Flags
+
+These flags are available on the installed Go binaries (v2.5.0+):
+
+```bash
+# Print resolved configuration (no auth, no network)
+credential-process --explain
+
+# Print proxy and cache status
+otel-helper --status
+
+# Show version with commit SHA
+credential-process --version   # → credential-process v2.5.0-beta.91 (62a232f)
+```
+
+`--explain` output includes: auth mode (oidc/idc/passthrough), provider type, federation type, quota config, storage mode, and file paths. Useful for verifying the binary detected the correct configuration before debugging auth failures.

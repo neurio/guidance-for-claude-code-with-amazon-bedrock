@@ -37,7 +37,59 @@ During `ccwb init`, quota monitoring is **enabled by default** when monitoring i
 
 Deploy using `poetry run ccwb deploy` (deploys all enabled stacks) or `poetry run ccwb deploy quota` for just the quota stack. The OIDC configuration is automatically passed from your profile settings. For complete deployment instructions, see the [CLI Reference](CLI_REFERENCE.md#deploy---deploy-infrastructure).
 
-## Configuration Settings
+## Cost-Based Enforcement (Recommended)
+
+Set dollar limits instead of (or alongside) token limits. Cost is calculated server-side using per-model Bedrock pricing rates.
+
+### How it works
+
+1. `quota_monitor` queries PromQL by `(user.email, type, model)` every 15 minutes
+2. Each token batch is priced using the actual model: Opus tokens × Opus rate, Sonnet tokens × Sonnet rate
+3. `cost_usd` and `daily_cost_usd` are accumulated in DynamoDB alongside raw token counts
+4. `quota_check` compares against `monthly_cost_limit` / `daily_cost_limit` from the policy
+
+### Setting cost limits
+
+```bash
+# Set $50/month budget for a user (--budget is shorthand for --monthly-cost-limit)
+ccwb quota set-user user@company.com --budget 50
+
+# Set $10/day budget for a team
+ccwb quota set-group engineering --daily-budget 10
+
+# Interactive mode (prompts for budget when no flags provided)
+ccwb quota set-user user@company.com
+```
+
+### Pricing rates ($/MTok)
+
+| Model | Input | Output | Cache Read | Cache Write |
+|-------|-------|--------|------------|-------------|
+| Fable | $10.00 | $50.00 | $1.00 | $12.50 |
+| Opus | $5.00 | $25.00 | $0.50 | $6.25 |
+| Sonnet | $3.00 | $15.00 | $0.30 | $3.75 |
+| Haiku | $1.00 | $5.00 | $0.10 | $1.25 |
+
+Rates are overridable via `BEDROCK_PRICING_RATES_JSON` Lambda env var.
+
+### Handles opusplan correctly
+
+When using `opusplan` (Opus planning + Sonnet execution), each token batch includes the model dimension from OTEL. Opus tokens are priced at Opus rates, Sonnet tokens at Sonnet rates — no blending assumptions.
+
+### Backward compatible
+
+- Cost limits default to 0 (disabled) — existing token-only deployments unaffected
+- Token limits still work independently — both can coexist
+- `cost_usd` field appears in DynamoDB on next `quota_monitor` run (ADD operation, non-breaking)
+
+> ⚠️ Cost estimates use published on-demand Bedrock rates. Actual billing may differ with committed throughput or custom agreements. Use AWS Cost Explorer for billing truth.
+
+> **Why not use the client-side `claude_code.cost.usage` metric?** Claude Code emits a cost estimate natively, but it uses generic Anthropic rates (not Bedrock-specific), resets per session (not accumulated monthly), and cannot be trusted for enforcement (client-controlled). Server-side calculation from raw token counts is tamper-resistant, uses admin-configurable Bedrock rates, and aggregates across all sessions.
+
+> **CoWork support:** Claude Desktop cost enforcement works when the CoWork dashboard stack is deployed with the `model` MetricFilter dimension (included by default). Requires attribution headers configured so `user_email` and `model` dimensions are present in the events.
+
+
+## Token-Based Limits (Legacy)
 
 | Parameter               | Default     | Description                                    |
 | ----------------------- | ----------- | ---------------------------------------------- |
@@ -50,7 +102,7 @@ Deploy using `poetry run ccwb deploy` (deploys all enabled stacks) or `poetry ru
 | Critical Threshold      | 90% (202.5M)| Second alert level                             |
 | Check Frequency         | 15 minutes  | Lambda execution interval                      |
 | Alert Retention         | 60 days     | DynamoDB TTL for deduplication                 |
-| EnableFinegrainedQuotas | true        | Enable fine-grained policy support             |
+| EnableFinegrainedQuotas | false       | Enable fine-grained policy support             |
 
 To update limits: Re-run `ccwb init` and redeploy with `ccwb deploy quota`.
 
@@ -540,7 +592,9 @@ The Quota Check API is a secured HTTP endpoint that validates user quotas before
 
 The API requires JWT authentication using your OIDC provider's tokens:
 
-- **Authentication**: JWT token in `Authorization: Bearer <token>` header
+> **IAM Identity Center users**: Quota enforcement uses IAM SigV4 authentication instead of JWT. The credential-process signs the quota API request with SigV4 (`execute-api` service). API Gateway validates IAM credentials, and the quota Lambda extracts the user email from the caller ARN session name (`arn:aws:sts::ACCOUNT:assumed-role/Role/user@company.com`). Same per-user DynamoDB lookup and enforcement as OIDC. See [IAM Identity Center Setup](providers/iam-identity-center-setup.md) for details.
+
+- **Authentication**: JWT token in `Authorization: Bearer <token>` header (OIDC) or SigV4-signed request (IDC)
 - **Validation**: API Gateway JWT Authorizer validates the token against your OIDC provider
 - **User Identity**: Email and group membership extracted from validated JWT claims (no query parameters)
 
@@ -601,22 +655,22 @@ Configure the endpoint in your credential provider config.json:
 
 ### Enforcement Timing
 
-**Important**: Quota enforcement only occurs at credential issuance time, not during an active session.
+**Important**: Quota enforcement occurs at credential issuance time — every time the credential-process exchanges tokens for AWS credentials. This includes both browser re-authentication and silent refresh (via stored refresh_token).
 
-If a user exceeds their quota mid-session, they can continue using Claude Code until their credentials expire and they need to re-authenticate. At that point, the quota check will block access.
+With silent refresh enabled (default since June 2026), the credential-process automatically renews credentials without browser interaction. Quota is checked on each renewal, so enforcement gaps are bounded by the STS session duration, not by how often the user sees a browser prompt.
 
-#### Example Timeline (12-hour session)
+#### Example Timeline (1-hour STS session, silent refresh)
 
 ```
-09:00 - User authenticates, quota check passes (at 50% of limit)
-09:00 - AWS credentials issued, valid for 12 hours
-15:00 - User exceeds 100% of monthly quota
-15:01 - User CONTINUES working (credentials still valid)
-21:00 - Credentials expire, user must re-authenticate
-21:00 - Quota check BLOCKS access (enforcement finally applied)
+09:00 - User authenticates via browser, quota check passes (at 50%)
+09:00 - AWS credentials issued, valid for 1 hour
+10:00 - Credentials expire, silent refresh triggers
+10:00 - Quota check passes (at 80%), new credentials issued
+11:00 - Silent refresh triggers again
+11:00 - Quota check BLOCKS access (user exceeded limit)
 ```
 
-In this scenario, there's a 6-hour gap between exceeding the quota (15:00) and enforcement (21:00).
+The enforcement gap equals the STS session duration (typically 1 hour), regardless of refresh_token lifetime.
 
 #### Recommendation for Tight Enforcement
 
@@ -643,15 +697,124 @@ Configure in your profile:
 
 **Trade-off**: Shorter sessions mean more frequent re-authentication prompts for users, but provide tighter quota enforcement.
 
+## Sidecar Bypass Detection
+
+In sidecar mode, per-user token usage is measured from telemetry the local OTEL
+sidecar sends to CloudWatch. If a developer stops the sidecar on their machine,
+their usage stops being counted — so the quota check never sees them exceed a
+limit, even though they can still invoke Bedrock. This is an inherent property
+of client-side telemetry.
+
+Sidecar bypass detection is an **opt-in detective control** that surfaces this.
+It does not block access; it reports which users are invoking Bedrock without
+reporting telemetry, so administrators can follow up.
+
+### How It Works
+
+A scheduled Lambda (`claude-code-bypass-detection`) runs every 15 minutes and:
+
+1. Queries **CloudTrail** for Bedrock invocation events (`InvokeModel`,
+   `InvokeModelWithResponseStream`, `Converse`, `ConverseStream`) in the last
+   window. These are logged as CloudTrail **management events** — captured by
+   default, with no trail or data-event charges. The caller's email is read from
+   the assumed-role session name (`assumed-role/<role>/<email>`), making this a
+   tamper-proof source of truth for who actually used Bedrock.
+2. For each of those (typically few) active users, does a single DynamoDB
+   `GetItem` point read on their `UserQuotaMetrics` record and checks whether
+   `last_updated` falls within the window. This scales with the number of
+   *active* users, not the total user count — no full-table scan.
+3. A user active in CloudTrail whose record is missing or stale has a
+   stopped/bypassed sidecar.
+4. Publishes CloudWatch metrics under the `ClaudeCode/SidecarHealth` namespace
+   (`SidecarStopped` per user, `SidecarStoppedUserCount` aggregate) and sends an
+   SNS alert (via the existing quota alert topic) listing affected users.
+
+### Configuration
+
+Disabled by default (opt-in). Enable during `ccwb init` (sidecar mode only) or
+via the `EnableBypassDetection` parameter on the quota stack. In central mode the
+collector runs server-side (users cannot stop it), so this control is disabled
+automatically.
+
+```bash
+# Enable during init
+ccwb init  # Select "Yes" for bypass detection when prompted (sidecar mode)
+
+# Or enable on existing deployment
+ccwb deploy quota --parameters EnableBypassDetection=true
+```
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| EnableBypassDetection | false | Enable sidecar bypass detection (sidecar mode) |
+| BypassDetectionLookbackMinutes | 15 | Detection window; should match the detection schedule |
+
+### Limitations
+
+- **Detective, not preventive.** It reports bypass; it does not block Bedrock.
+  For tamper-proof enforcement, source quota usage from Bedrock model invocation
+  logging (server-side) — a larger change tracked as a future enhancement.
+- Relies on Bedrock runtime calls being present in CloudTrail management events
+  (the default). Detection lag is one schedule interval (15 minutes).
+- Alerts fire every schedule interval (15 min) while bypass is active. To reduce
+  notification frequency, create a CloudWatch Alarm on `SidecarStoppedUserCount`
+  with a longer evaluation period (e.g., 1 hour) instead of relying on raw SNS.
+
 ## Current Limitations
 
 - Quotas reset on calendar month/day (UTC timezone)
-- Requires email claim in JWT tokens
-- Group membership requires JWT group claims from identity provider
+- Requires email claim in JWT tokens, or email as IAM session name for Identity Center users (see [IAM Identity Center Setup](providers/iam-identity-center-setup.md#quota-enforcement))
+- Group membership requires JWT group claims from identity provider (not available for IDC users — user-level policies only)
 - Enforcement only at credential issuance (see [Enforcement Timing](#enforcement-timing) for mitigation)
+
+## CoWork 3P Usage Counting
+
+When the CoWork dashboard stack is deployed, CoWork (Claude Desktop) token usage is automatically counted toward the same per-user quota as Claude Code:
+
+| Source | Namespace | Metric | Dimension |
+|--------|-----------|--------|-----------|
+| Claude Code | `ClaudeCode` | `claude_code.token.usage` | `user.email` |
+| CoWork 3P | `ClaudeCoWork` | `token.usage.input` / `token.usage.output` | `user_email` |
+
+The `quota_monitor` Lambda queries both namespaces and merges the results into a single DynamoDB record per user. This means:
+
+- `ccwb quota usage <email>` shows combined Claude Code + CoWork usage
+- Quota limits apply to the combined total
+- A user hitting their limit on CoWork will be blocked on the next Claude Code credential refresh (and vice versa)
+
+**Requirements:**
+- CoWork monitoring stack deployed (`ccwb deploy --stack cowork-dashboard`)
+- Attribution headers configured (collector injects `user_email` from `x-user-email` HTTP header)
+- Central or sidecar monitoring mode (both support CoWork telemetry counting)
+
+**Without attribution headers:** CoWork usage is aggregate-only and cannot be counted toward individual user quotas. The `quota_monitor` CoWork query gracefully returns empty results.
+
+## Data Latency
+
+Different data paths have different latency characteristics:
+
+| Data path | Latency | Use case |
+| --- | --- | --- |
+| Quota enforcement (DynamoDB) | ~1-5 seconds | Real-time quota checks |
+| CloudWatch metrics/dashboards | ~1-5 minutes | Live operational monitoring |
+| Analytics (Firehose → S3 → Athena) | Up to 15 minutes | Historical reporting, cost analysis |
+
+The analytics pipeline uses Kinesis Firehose with a configurable buffer interval
+(`FirehoseBufferInterval` parameter, default 900 seconds / 15 minutes). Firehose
+accumulates records before flushing to S3 to reduce cost and API calls.
+
+To reduce analytics latency, lower the buffer interval (minimum 60 seconds) at
+the cost of more frequent S3 writes:
+
+```bash
+ccwb deploy analytics --parameters FirehoseBufferInterval=60
+```
 
 ## Future Enhancements
 
+- **Tamper-proof enforcement**: Source quota usage from Bedrock model invocation
+  logging (server-side) so usage is counted even if the sidecar is stopped,
+  upgrading sidecar health monitoring from detective to preventive.
 - **Bulk import/export**: Manage policies via JSON files
 - **Quota reporting**: Generate usage reports across all users
 

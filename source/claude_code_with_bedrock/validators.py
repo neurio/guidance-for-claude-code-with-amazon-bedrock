@@ -23,9 +23,8 @@ AWS_REGIONS = {
     "eu-north-1",
     "eu-south-1",
     "eu-south-2",
-    "eu-south-3",
     "ap-south-1",
-    "ap-south-5",
+    "ap-south-2",
     "ap-northeast-1",
     "ap-northeast-2",
     "ap-northeast-3",
@@ -104,9 +103,7 @@ class ProfileValidator:
         # Validate profile name format
         name = profile_data.get("name", "")
         if not ProfileValidator._is_valid_profile_name(name):
-            errors.append(
-                f"Invalid profile name '{name}'. " "Must be alphanumeric with hyphens only, max 64 characters"
-            )
+            errors.append(f"Invalid profile name '{name}'. Must be alphanumeric with hyphens only, max 64 characters")
 
         # Validate provider domain format
         domain = profile_data.get("provider_domain", "")
@@ -125,7 +122,7 @@ class ProfileValidator:
 
         # Validate provider type if specified
         provider_type = profile_data.get("provider_type")
-        if provider_type and provider_type not in ["okta", "auth0", "azure", "cognito"]:
+        if provider_type and provider_type not in ["okta", "auth0", "azure", "cognito", "google", "generic"]:
             warnings.append(f"Unknown provider_type: {provider_type}")
 
         # Conditional validation: Cognito requires user_pool_id
@@ -135,6 +132,18 @@ class ProfileValidator:
                 errors.append("cognito_user_pool_id is required when provider_type is 'cognito'")
             elif not ProfileValidator._is_valid_cognito_user_pool_id(user_pool_id):
                 errors.append(f"Invalid cognito_user_pool_id format: {user_pool_id}")
+
+        # Conditional validation: Generic OIDC requires issuer + endpoints + thumbprint
+        if provider_type == "generic":
+            for required_field in (
+                "oidc_issuer_url",
+                "oidc_authorization_endpoint",
+                "oidc_token_endpoint",
+                "oidc_jwks_uri",
+                "oidc_thumbprint",
+            ):
+                if not profile_data.get(required_field):
+                    errors.append(f"{required_field} is required when provider_type is 'generic'")
 
         # Validate federation type
         federation_type = profile_data.get("federation_type", "cognito")
@@ -154,7 +163,7 @@ class ProfileValidator:
         if distribution_type:
             if distribution_type not in ["presigned-s3", "landing-page"]:
                 errors.append(
-                    f"Invalid distribution_type: {distribution_type}. " "Must be 'presigned-s3' or 'landing-page'"
+                    f"Invalid distribution_type: {distribution_type}. Must be 'presigned-s3' or 'landing-page'"
                 )
 
             # Landing page requires additional fields
@@ -162,15 +171,27 @@ class ProfileValidator:
                 dist_provider = profile_data.get("distribution_idp_provider")
                 if not dist_provider:
                     errors.append("distribution_idp_provider is required for landing-page distribution")
-                elif dist_provider not in ["okta", "auth0", "azure", "cognito"]:
+                elif dist_provider not in ["okta", "auth0", "azure", "cognito", "generic"]:
                     errors.append(
                         f"Invalid distribution_idp_provider: {dist_provider}. "
-                        "Must be 'okta', 'auth0', 'azure', or 'cognito'"
+                        "Must be 'okta', 'auth0', 'azure', 'cognito', or 'generic'"
                     )
 
-                dist_domain = profile_data.get("distribution_idp_domain")
-                if not dist_domain:
-                    errors.append("distribution_idp_domain is required for landing-page distribution")
+                # Domain-derived providers need a domain; generic providers supply explicit
+                # endpoints instead (the domain isn't used to build the ALB OIDC config).
+                if dist_provider == "generic":
+                    for required_field in (
+                        "distribution_idp_issuer",
+                        "distribution_idp_authorization_endpoint",
+                        "distribution_idp_token_endpoint",
+                        "distribution_idp_userinfo_endpoint",
+                    ):
+                        if not profile_data.get(required_field):
+                            errors.append(f"{required_field} is required for generic landing-page distribution")
+                else:
+                    dist_domain = profile_data.get("distribution_idp_domain")
+                    if not dist_domain:
+                        errors.append("distribution_idp_domain is required for landing-page distribution")
 
                 dist_client_id = profile_data.get("distribution_idp_client_id")
                 if not dist_client_id:
@@ -202,7 +223,7 @@ class ProfileValidator:
             valid_profiles = ["us", "europe", "apac", "global", "japan", "eu"]
             if cross_region not in valid_profiles:
                 warnings.append(
-                    f"Unknown cross_region_profile: {cross_region}. " f"Expected one of: {', '.join(valid_profiles)}"
+                    f"Unknown cross_region_profile: {cross_region}. Expected one of: {', '.join(valid_profiles)}"
                 )
 
         # Validate quota settings
@@ -231,7 +252,7 @@ class ProfileValidator:
                 errors.append("data_retention_days must be a positive integer")
             elif retention_days > 365:
                 warnings.append(
-                    f"data_retention_days ({retention_days}) is over 1 year. " "This may incur significant costs."
+                    f"data_retention_days ({retention_days}) is over 1 year. This may incur significant costs."
                 )
 
         # Validate schema version
@@ -326,6 +347,28 @@ class ProfileValidator:
         # Example: us-east-1_rFo2lol9W
         pool_pattern = r"^[a-z]{2}-[a-z]+-\d+_[a-zA-Z0-9]+$"
         return bool(re.match(pool_pattern, pool_id))
+
+    @staticmethod
+    def validate_application_inference_profile_arn(arn: str) -> str | None:
+        """Validate an Application Inference Profile ARN.
+
+        Args:
+            arn: ARN to validate, or empty string / None.
+
+        Returns:
+            None if valid (or empty/None), error message string if invalid.
+        """
+        if not arn or not arn.strip():
+            return None  # Empty is valid (means not configured)
+
+        arn = arn.strip()
+        pattern = r"^arn:(aws|aws-us-gov):bedrock:[a-z0-9-]+:\d{12}:application-inference-profile/[a-zA-Z0-9_-]+$"
+        if not re.match(pattern, arn):
+            return (
+                "Invalid Application Inference Profile ARN. Expected format: "
+                "arn:aws:bedrock:{region}:{account-id}:application-inference-profile/{profile-id}"
+            )
+        return None
 
 
 def validate_profile(profile_data: dict[str, Any]) -> ValidationResult:

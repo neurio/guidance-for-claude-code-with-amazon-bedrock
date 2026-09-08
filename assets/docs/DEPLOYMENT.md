@@ -44,7 +44,12 @@ Once configuration is complete, deploy the infrastructure with:
 poetry run ccwb deploy
 ```
 
-This single command orchestrates the creation of multiple AWS resources. Depending on your chosen authentication method, it creates either an IAM OIDC Provider or a Cognito Identity Pool to establish the trust relationship with your identity provider. IAM roles and policies grant precisely scoped Bedrock access. If you enabled monitoring, it also deploys an ECS Fargate cluster running OpenTelemetry collector, complete with CloudWatch dashboards.
+This single command orchestrates the creation of multiple AWS resources. Depending on your chosen authentication method, it creates either an IAM OIDC Provider or a Cognito Identity Pool to establish the trust relationship with your identity provider. IAM roles and policies grant precisely scoped Bedrock access.
+
+The stacks deployed by `ccwb deploy` depend on the monitoring mode selected during `ccwb init`:
+
+- **Central mode**: Deploys networking, s3bucket, monitoring, dashboard, and analytics stacks (ECS Fargate collector shared by all users).
+- **Sidecar mode**: Deploys only the dashboard stack. The OpenTelemetry collector runs locally on each developer's machine, so no server-side networking or monitoring infrastructure is needed.
 
 > **Deployment Options**: For more control, see the [CLI Reference](CLI_REFERENCE.md) for deploying specific stacks or using dry-run mode.
 
@@ -54,44 +59,72 @@ With infrastructure deployed, you're ready to create the package that end users 
 
 ### Multi-Platform Build Support
 
-Claude Code supports building for all major platforms:
+The packaging system uses Go cross-compilation to produce native binaries for all platforms from a single machine:
 
 ```bash
-# Build for all platforms (recommended)
-poetry run ccwb package --target-platform=all
-
-# Build for specific platforms
-poetry run ccwb package --target-platform=windows    # Windows via CodeBuild
-poetry run ccwb package --target-platform=macos      # Current macOS architecture
-poetry run ccwb package --target-platform=linux      # Linux via Docker
+# Build for all platforms (recommended — works from any OS)
+poetry run ccwb package --go --target-platform all
 ```
 
-**Platform Build Methods (Hybrid System):**
+This single command:
+- Cross-compiles Go binaries for all 5 platforms (macOS ARM64/Intel, Linux x64/ARM64, Windows x64)
+- Generates customer-specific `config.json` and `settings.json` from your deployment profile
+- Includes `otel-helper` binary if monitoring is enabled
+- Produces ready-to-distribute install packages with platform-specific installers
+
+**Requirements:** Go 1.24+ installed. Go supports native cross-compilation, so all 5 platform binaries are produced from any single machine (macOS, Linux, or Windows) without Docker or CodeBuild. Build time: ~10 seconds for all platforms.
+
+> **Legacy mode:** Running `ccwb package` without `--go` uses the PyInstaller/Nuitka/Docker/CodeBuild pipeline. This is retained for backward compatibility.
+
+<details>
+<summary>Legacy build mode details</summary>
+
+PyInstaller emits binaries in the host OS's native format, so the build host must match the target OS. Only Windows (via CodeBuild) escapes this constraint.
+
+| Target binary | Build host required | Tooling |
+|---|---|---|
+| `macos-arm64`, `macos-intel` | **macOS** | PyInstaller (native) |
+| `linux-x64`, `linux-arm64` | Linux, **or** macOS with Docker Desktop | PyInstaller (Docker container when building from macOS) |
+| `windows` | any host | AWS CodeBuild (remote) |
 
 - **Windows**: Uses Nuitka via AWS CodeBuild
-  - Optimized for performance and minimal antivirus false positives
-- **macOS**: Uses PyInstaller with architecture-specific builds
-  - ARM64: Native build on Apple Silicon Macs (works on all Macs via Rosetta)
-  - Intel: **Optional** - requires x86_64 Python environment on ARM Macs
-  - Universal: Requires both architectures' Python libraries
-- **Linux x64/ARM64**: Uses PyInstaller in Docker containers
-  - Automatically builds both architectures when Docker is available
-  - Docker Desktop handles architecture emulation via Rosetta
+- **macOS**: Uses PyInstaller with architecture-specific builds (ARM64 or Intel)
+- **Linux x64/ARM64**: Uses PyInstaller in Docker containers (cross-compiled from macOS)
 
-**Optional: Intel Mac Setup**
+**Linux admins cannot produce macOS binaries** — the package command refuses this combination with a clear error.
 
-To build Intel binaries on Apple Silicon Macs, you'll need an x86_64 Python environment.
-See [CLI Reference](CLI_REFERENCE.md#intel-mac-build-setup-optional) for setup instructions.
+</details>
 
-The package command will continue successfully even without this setup.
+**Which macOS binary should you ship?**
 
-This command performs several operations. First, it retrieves the Cognito Identity Pool ID from your deployed CloudFormation stack. Then it compiles the Python authentication code into standalone executables using PyInstaller for macOS/Linux and Nuitka for Windows. Your organization's configuration - provider domain, client ID, and infrastructure details - gets written to a config.json file that the executables read at runtime.
+| Your developer fleet | Recommended binary | Notes |
+|---|---|---|
+| Apple Silicon only | `macos-arm64` | Native, no extra setup |
+| Intel only | `macos-intel` | Native, no extra setup |
+| Mixed (or unknown) | `macos-intel` | Covers everyone — runs natively on Intel, via Rosetta on Apple Silicon |
+| Performance-conscious mixed fleet | Both `macos-arm64` + `macos-intel` | Installer picks the right one per device |
+
+> **Rosetta translation:** Intel (`x86_64`) binaries run on Apple Silicon via Apple's Rosetta 2 translation layer — users don't need to do anything. ARM64 binaries cannot run on Intel Macs at all.
+
+**Optional: Cross-arch macOS Builds (legacy mode only)**
+
+By default, legacy-mode `ccwb package` builds only for your Mac's own architecture (arm64 on Apple Silicon, x86_64 on Intel). To build for the other architecture — for example, an Apple Silicon admin building the Intel binary to cover Intel Mac users — install a universal2 Python:
+
+1. Download the **macOS 64-bit universal2 installer** for Python 3.12 from [python.org/downloads/macos](https://www.python.org/downloads/macos/)
+2. Run the installer — it places Python at `/Library/Frameworks/Python.framework/`
+3. Re-run `ccwb package` — it detects the universal2 Python automatically and builds both architectures
+
+On first cross-arch build, `ccwb` creates an isolated build environment at `~/.ccwb/build-venvs/` (~30s). Subsequent runs reuse it.
+
+Without universal2 Python: `--target-platform=all` skips the cross-arch target with a note and continues normally. Explicitly requesting the cross-arch target (e.g. `--target-platform=macos-intel` on Apple Silicon) fails with a clear error pointing to the python.org installer.
+
+(Cross-arch builds are not needed with `--go` — Go cross-compiles all platforms natively.)
 
 The resulting `dist/` folder contains everything users need:
 
 - Platform-specific executables (`credential-process-<platform>`) handle the OAuth2 authentication flow
 - The configuration file includes all necessary settings
-- Intelligent installer scripts (`install.sh` for Unix, `install.bat` for Windows) detect the user's architecture and set up their AWS profile automatically
+- Intelligent installer scripts (`install.sh` for Unix, `install.bat` + `ccwb-install.ps1` for Windows) detect the user's architecture and set up their AWS profile automatically
 - If you enabled monitoring, OTEL helper executables and Claude Code telemetry settings that point to your OpenTelemetry collector
 
 ### Windows Build System (Optional)
@@ -125,6 +158,25 @@ Windows binary builds use AWS CodeBuild with Nuitka for optimal performance. Win
 - If CodeBuild is not enabled, Windows builds will be silently skipped
 - Windows builds take 20+ minutes
 - To enable Windows builds after initial setup, re-run `poetry run ccwb init`
+
+### Organization-Wide Enforcement (Optional)
+
+For large deployments (50+ users) where settings must be non-overridable, use managed settings:
+
+```bash
+poetry run ccwb init --managed
+poetry run ccwb package --go
+```
+
+This writes settings to the OS-level `managed-settings.json` path instead of user-scope `~/.claude/settings.json`. Managed settings have the **highest precedence** in Claude Code's settings hierarchy and cannot be edited or overridden by end users.
+
+| OS | Managed path | Requires |
+|---|---|---|
+| macOS | `/Library/Application Support/ClaudeCode/managed-settings.json` | `sudo` |
+| Linux/WSL | `/etc/claude-code/managed-settings.json` | `sudo` |
+| Windows | `C:\Program Files\ClaudeCode\managed-settings.json` | Administrator |
+
+The installer will detect managed settings in the package and prompt for elevated privileges. For MDM-managed fleets (Jamf, Intune, Group Policy), see Anthropic's [MDM templates](https://github.com/anthropics/claude-code/tree/main/examples/mdm) for alternative delivery.
 
 ## Phase 4: Testing Your Deployment
 
@@ -167,7 +219,7 @@ Share the `dist/` folder through your normal software distribution channels - pe
 **Installation by Platform:**
 
 - **Windows**: Users run `install.bat`
-- **macOS/Linux**: Users run `./install.sh`
+- **macOS/Linux**: Users run `chmod +x install.sh && ./install.sh`
 
 Regardless of distribution method, the user experience remains simple. They receive the package, run the installer for their platform, and they're done. The installer:
 

@@ -8,11 +8,19 @@ This document provides technical details about the Claude Code authentication sy
 
 The Claude Code authentication system enables secure, scalable access to Amazon Bedrock by federating enterprise identity providers through AWS Cognito. The architecture follows zero-trust principles with complete audit trails.
 
-## Component Architecture
-
 ### Authentication Components
 
-The core authentication component is the credential process located in `source/credential_provider/`. This implements a complete OAuth2/OIDC client with PKCE flow for secure authentication without client secrets. When packaged for distribution, PyInstaller compiles this into a standalone executable that end users can run without needing Python installed. The credential process supports multiple identity providers including Okta, Azure AD, Auth0, and Cognito User Pools through a flexible provider registry system. Once authenticated, credentials are cached either in the operating system's secure keyring or in session files, depending on the organization's preference. The implementation follows the AWS CLI credential process protocol, making it transparent to any AWS SDK or tool.
+The credential process is a native Go binary (`source/go/`) implementing the full authentication lifecycle:
+
+- **OAuth2/OIDC with PKCE** — browser-based login, no client secrets
+- **Silent refresh** — stores OIDC refresh_token for automatic renewal (7-30 days without browser re-auth)
+- **Token caching** — OS keyring (macOS Keychain, Windows Credential Manager, Linux Secret Service) or encrypted session files
+- **Multi-provider registry** — Okta, Azure AD, Auth0, Google, Cognito, generic OIDC
+- **Cross-platform** — single `make all` produces 5 binaries (macOS ARM64/Intel, Linux x64/ARM64, Windows x64) via Go cross-compilation
+
+The Go rewrite (June 2026) replaced the Python credential-provider, eliminating PyInstaller/Nuitka build complexity, AV false positives on Windows, and the 60-80MB binary size (now ~14MB).
+
+The core authentication component is the credential process, implemented as a native Go binary in `source/go/`. This implements a complete OAuth2/OIDC client with PKCE flow for secure authentication without client secrets. Go cross-compilation produces native statically-linked binaries for all 5 platforms (macOS ARM64/Intel, Linux x64/ARM64, Windows x64) from a single build, eliminating the need for per-platform build toolchains. The credential process supports multiple identity providers including Okta, Azure AD, Auth0, and Cognito User Pools through a flexible provider registry system. Once authenticated, credentials are cached either in the operating system's secure keyring or in session files, depending on the organization's preference. The implementation follows the AWS CLI credential process protocol, making it transparent to any AWS SDK or tool.
 
 The management CLI in `source/claude_code_with_bedrock/` provides IT administrators with tools to deploy and manage the infrastructure. Built on the Cleo framework, it offers an intuitive command-line interface for initialization, deployment, and package generation. This component is used only during setup and is not distributed to end users.
 
@@ -34,21 +42,15 @@ The IAM role assigned to authenticated users grants the following Amazon Bedrock
 
 These permissions are scoped to the configured regions and enable users to discover and invoke models through cross-region inference profiles, ensuring optimal performance and availability.
 
-#### IAM Permissions
+When monitoring is enabled, the solution supports two deployment modes:
 
-The IAM role assigned to authenticated users grants the following Amazon Bedrock permissions:
+**Central Mode** (default): A shared, server-side collector ingests metrics from all clients.
+- Client → ALB → ECS OTEL Collector → CloudWatch OTLP + EMF logs
+- Deploys a VPC with public subnets, an ECS Fargate cluster running the OpenTelemetry collector, and an Application Load Balancer as the ingestion endpoint. When analytics is enabled, the collector additionally writes EMF logs to CloudWatch Logs for the analytics pipeline (Athena SQL over historical data).
 
-- `bedrock:InvokeModel` - Invoke foundation models for text generation
-- `bedrock:InvokeModelWithResponseStream` - Invoke models with streaming responses
-- `bedrock:ListFoundationModels` - List available foundation models
-- `bedrock:GetFoundationModel` - Get details about specific models
-- `bedrock:GetFoundationModelAvailability` - Check model availability in regions
-- `bedrock:ListInferenceProfiles` - List available cross-region inference profiles
-- `bedrock:GetInferenceProfile` - Get details about specific inference profiles
-
-These permissions are scoped to the configured regions and enable users to discover and invoke models through cross-region inference profiles, ensuring optimal performance and availability.
-
-When monitoring is enabled, the solution deploys additional infrastructure to collect and analyze usage metrics. A VPC with public subnets hosts an ECS Fargate cluster running the OpenTelemetry collector. An Application Load Balancer provides the ingestion endpoint for metrics from Claude Code clients. The collector processes these metrics and forwards them to CloudWatch Logs in Embedded Metric Format, enabling real-time dashboards and alerting.
+**Sidecar Mode**: Each client runs a local OpenTelemetry collector that exports directly to CloudWatch.
+- Client → localhost:4318 → Local OTEL Collector → CloudWatch OTLP (SigV4)
+- No server-side networking or ECS infrastructure is required. The local collector authenticates to CloudWatch using SigV4 with the user's federated credentials. Only the CloudWatch dashboard stack is deployed on the AWS side.
 
 For organizations requiring detailed analytics, the optional analytics stack provides comprehensive usage analysis capabilities. Kinesis Data Firehose continuously streams metrics from CloudWatch Logs to an S3 data lake, with a Lambda function transforming the data into Parquet format for efficient querying. Amazon Athena enables SQL analytics on this data, with pre-configured partition projection eliminating the need for Glue crawlers. This architecture supports queries spanning months of historical data while keeping costs minimal through columnar storage and lifecycle policies.
 
@@ -96,9 +98,11 @@ Our implementation returns credentials in the exact format required by the AWS C
 
 The packaging and distribution system bridges the gap between IT administrators who deploy infrastructure and end users who need simple, foolproof installation. The `ccwb package` command creates a self-contained distribution that includes everything users need without requiring technical expertise.
 
-During packaging, PyInstaller compiles the Python credential process into platform-specific executables. For macOS, it creates a universal binary supporting both Intel and Apple Silicon. For Linux, it uses Docker to ensure compatibility across distributions. These executables are completely standalone - users don't need Python, pip, or any other dependencies installed.
+The packaging system uses Go cross-compilation (`ccwb package --go`) to produce native statically-linked binaries for all 5 platforms from a single machine, replacing the previous PyInstaller (macOS/Linux) and Nuitka/CodeBuild (Windows) build pipeline. The binaries are generic — they contain zero customer-specific data and work for all deployments.
 
-The package embeds the configuration created during deployment, including the Cognito Identity Pool ID retrieved from CloudFormation outputs. This eliminates any manual configuration for end users. The installer script detects the user's platform, copies the appropriate binary, creates the AWS CLI profile configuration, and sets up the credential process integration.
+The `ccwb package --go` command cross-compiles the binaries and generates customer-specific `config.json` (with federation config, quota settings) and `settings.json` (with Bedrock model, OTel endpoint) from the admin's profile. Only Go 1.24+ is required — no Docker, CodeBuild, or platform-specific toolchains needed.
+
+The package embeds the configuration created during deployment, including the federation identifier (role ARN or identity pool ID) read from the profile. Generic install scripts (`install.sh`, `install.bat`, `ccwb-install.ps1`) read profile names and regions from `config.json` at install time, so they work for any customer without regeneration.
 
 For organizations with monitoring enabled, the package also includes the OTEL helper executable and Claude Code settings. This provides a complete solution from authentication through telemetry without requiring users to understand the underlying complexity.
 

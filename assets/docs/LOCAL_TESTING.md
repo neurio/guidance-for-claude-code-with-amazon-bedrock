@@ -58,6 +58,7 @@ Create a test environment that simulates a fresh user installation:
 mkdir -p ~/test-user
 cp -r dist ~/test-user/
 cd ~/test-user/dist
+chmod +x install.sh
 ./install.sh
 ```
 
@@ -191,3 +192,104 @@ unset AWS_SESSION_TOKEN
 export AWS_PROFILE=ClaudeCode
 aws sts get-caller-identity
 ```
+
+### IAM Identity Center (IDC) on headless / SSH hosts
+
+IDC profiles (`auth_type: idc`) sign in with the browser-based device-authorization
+flow. The credential process runs this automatically the first time it needs
+credentials, printing a verification URL and code. On a desktop it also opens
+your browser; on a headless box or over SSH it detects the lack of a local
+browser (via `SSH_CONNECTION`/`SSH_TTY` or no `DISPLAY`) and instead shows a URL
+you open on any other device.
+
+**Just run `claude`.** When no valid session exists, Claude Code invokes the
+`awsAuthRefresh` hook, which signs you in — opening your browser on a desktop, or
+printing a verification URL + code on a headless/SSH host — then continues once
+you approve. It also refreshes your session automatically after that.
+
+```bash
+claude
+# First run (or after the SSO session expires): a sign-in prompt appears.
+# Desktop: your browser opens. Headless/SSH: a verification URL + code print;
+# open the URL on any device with a browser and approve. Claude Code continues.
+```
+
+**Optional: the `claude-bedrock` launcher.** The installer also generates a
+launcher next to the binaries (`~/claude-code-with-bedrock/claude-bedrock`, or
+`claude-bedrock.cmd` on Windows). It signs you in *first*, then starts Claude
+Code. The only functional difference is the sign-in step has no time limit —
+in-session sign-in via `claude` is capped at ~165s (see the callout below) — so
+the launcher can make a slow first sign-in (e.g. MFA on another device) smoother.
+
+```bash
+~/claude-code-with-bedrock/claude-bedrock
+# Signs you in (a no-op if a valid session is already cached), then runs claude.
+
+# Optional: add the folder to PATH so you can just type `claude-bedrock`:
+export PATH="$HOME/claude-code-with-bedrock:$PATH"
+
+# Use a non-default profile:
+AWS_PROFILE=ClaudeCode ~/claude-code-with-bedrock/claude-bedrock
+```
+
+You can also sign in by hand without launching Claude Code (e.g. to pre-warm the
+cache):
+
+```bash
+credential-process --login --profile ClaudeCode
+export AWS_PROFILE=ClaudeCode
+aws sts get-caller-identity
+```
+
+`--login` performs only the sign-in (it never prints credentials) and is a no-op
+when a valid session is already cached. No AWS CLI is required — the
+device-authorization login is built into the credential process binary, and the
+SSO token is cached in `~/.aws/sso/cache/` (refreshed automatically until the
+session fully expires).
+
+> **Do I still need the launcher?** No — plain `claude` handles first sign-in,
+> re-authentication, and refresh on its own, because Claude Code runs the
+> `awsAuthRefresh` (`--login`) hook and surfaces its sign-in prompt live in the
+> "Cloud authentication" panel. The launcher remains as an optional convenience
+> for one edge: Claude Code caps the `awsAuthRefresh` hook at 180 seconds (the
+> credential process stops at 165s to print a message first), so a sign-in that
+> takes longer than that — e.g. MFA on a separate device — will time out in-session
+> but has no time limit when run via the launcher. If the in-session prompt times
+> out, just send Claude Code another message to show a fresh sign-in link.
+>
+> If you need to see a credential error that already scrolled away, run Claude
+> Code with debug logging: `CLAUDE_CODE_DEBUG_LOGS_DIR=~/.claude/debug claude
+> --debug` captures credential-resolution output to a file.
+
+### IDC credential refresh during a session
+
+IDC role credentials are short-lived — their lifetime is set by the IAM Identity
+Center **permission set's session duration** (AWS default: 1 hour, max 12). For
+IDC the generated `settings.json` wires **two** Claude Code credential hooks,
+which work together:
+
+- **`awsCredentialExport`** — the primary resolver. Its output is captured
+  silently, and Claude Code re-invokes it automatically ~5 minutes before the
+  credentials' `Expiration`. This drives the *silent* hourly refresh: while the
+  longer-lived SSO session is still valid, the credential process re-mints role
+  credentials via STS with no browser. (Requires Claude Code **v2.1.176+**;
+  the credential-process JSON schema is accepted in **v2.1.181+**.)
+- **`awsAuthRefresh`** (`--login`) — fires on the first credential failure and
+  its output **is displayed to the user**. This is the only channel that can
+  surface the sign-in prompt, because `awsCredentialExport` discards stderr.
+  When there's no valid SSO session, this runs the interactive device-auth flow
+  in-session (browser on desktop, URL + code on headless), so `claude` recovers
+  without relaunching. It is capped at Claude Code's 180s hook timeout.
+
+Without `awsCredentialExport`, credentials are resolved only once at startup, so
+after the session duration elapses Claude Code retries expired credentials
+(`API error · Retrying…`) and, on EC2, the SDK chain falls back to the instance
+role. To prevent that silent wrong-identity fallback, IDC settings also set
+`AWS_EC2_METADATA_DISABLED=true`, so a refresh failure surfaces as a clear
+credentials error instead.
+
+The separate ~8-hour SSO **session** expiry still requires an interactive
+re-login. This happens in-session: `claude` runs `awsAuthRefresh` (`--login`) and
+shows the sign-in prompt live (browser on desktop, URL + code on headless). The
+`claude-bedrock` launcher does the same sign-in up front, without the in-session
+180s hook cap — useful if the re-login step is slow.

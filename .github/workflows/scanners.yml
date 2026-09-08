@@ -1,0 +1,28 @@
+name: Scanners
+on:
+  push:
+    branches: ["main", "beta"]
+  pull_request:
+    branches: ["main", "beta"]
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  secrets-scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Install detect-secrets
+        run: pip install detect-secrets
+      - name: detect-secrets
+        run: |
+          detect-secrets scan --baseline .secrets.baseline
+          cat .secrets.baseline | jq '[.results|to_entries|.[].value[]|{ "filename": .filename, "is_secret": .is_secret } | select(.filename | startswith("source/tests/") | not) | if .is_secret == null or .is_secret == true then .filename else empty end]|unique|if length>0 then error("potential secrets in: \(.)") else empty end'
