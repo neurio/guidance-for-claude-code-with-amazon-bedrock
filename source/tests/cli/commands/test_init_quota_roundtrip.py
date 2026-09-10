@@ -39,6 +39,17 @@ def _make_profile() -> Profile:
         monthly_enforcement_mode="alert",
         quota_check_interval=5,
         enable_bypass_detection=True,
+        telemetry_db_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:telemetry-AbCdEf",
+        telemetry_db_host="10.0.0.1",
+        telemetry_db_port=15432,
+        telemetry_db_name="claude_telemetry_test",
+        telemetry_db_ssl_mode="verify-full",
+        telemetry_db_ca_pem="-----BEGIN CERTIFICATE-----\nxyz\n-----END CERTIFICATE-----",
+        telemetry_db_vpc_id="vpc-0abc",
+        telemetry_db_subnet_ids=["subnet-0aaa", "subnet-0bbb"],
+        telemetry_db_egress_cidr="10.0.0.0/20",
+        quota_write_mode="enforce",
+        quota_db_min_row_ratio=0.75,
     )
 
 
@@ -79,3 +90,88 @@ def test_rerun_preserves_all_quota_fields():
     assert quota["monthly_enforcement_mode"] == "alert"
     assert quota["check_interval"] == 5
     assert quota["enable_bypass_detection"] is True
+
+
+def test_rerun_preserves_telemetry_db_settings():
+    """The telemetry DB is the usage source; losing it silently disables counting.
+
+    A dropped field here is worse than a cosmetic reset: without
+    telemetry_db_secret_arn the monitor has no usage source at all, and a reset
+    write_mode would flip a deliberate 'enforce' cutover back to 'shadow'.
+    """
+    rebuilt = _rebuild_config(_make_profile())
+
+    quota = rebuilt["quota"]
+    assert quota["telemetry_db_secret_arn"].endswith(":secret:telemetry-AbCdEf")
+    assert quota["telemetry_db_host"] == "10.0.0.1"
+    assert quota["telemetry_db_port"] == 15432
+    assert quota["telemetry_db_name"] == "claude_telemetry_test"
+    assert quota["telemetry_db_ssl_mode"] == "verify-full"
+    assert "BEGIN CERTIFICATE" in quota["telemetry_db_ca_pem"]
+    assert quota["telemetry_db_vpc_id"] == "vpc-0abc"
+    assert quota["telemetry_db_subnet_ids"] == ["subnet-0aaa", "subnet-0bbb"]
+    assert quota["telemetry_db_egress_cidr"] == "10.0.0.0/20"
+    # The Profile attribute is quota_write_mode; the config dict key is write_mode.
+    assert quota["write_mode"] == "enforce"
+    assert quota["db_min_row_ratio"] == 0.75
+
+
+TELEMETRY_DB_ATTRS = (
+    "telemetry_db_secret_arn",
+    "telemetry_db_host",
+    "telemetry_db_port",
+    "telemetry_db_name",
+    "telemetry_db_ssl_mode",
+    "telemetry_db_ca_pem",
+    "telemetry_db_vpc_id",
+    "telemetry_db_subnet_ids",
+    "telemetry_db_egress_cidr",
+    "quota_write_mode",
+    "quota_db_min_row_ratio",
+)
+
+
+def test_full_save_then_rebuild_round_trip():
+    """Pin _save_configuration and _check_existing_deployment against each other.
+
+    A field added to one map but not the other passes the single-direction tests
+    above and still loses data on a re-run, so drive the real save path here.
+    """
+    original = _make_profile()
+    rebuilt = _rebuild_config(original)
+
+    # Feed the rebuilt dict back through the save path and inspect the Profile it
+    # produces, without touching the user's real config file.
+    saved: dict = {}
+    fake_config = Config()
+
+    def _capture(profile):
+        saved["profile"] = profile
+
+    with (
+        patch.object(Config, "load", return_value=fake_config),
+        patch.object(fake_config, "get_profile", return_value=None),
+        patch.object(fake_config, "add_profile", side_effect=_capture),
+        patch.object(fake_config, "set_active_profile"),
+        patch.object(fake_config, "save"),
+    ):
+        InitCommand()._save_configuration(
+            {
+                "provider_domain": original.provider_domain,
+                "client_id": original.client_id,
+                "credential_storage": original.credential_storage,
+                "aws": {
+                    "region": original.aws_region,
+                    "identity_pool_name": original.identity_pool_name,
+                    "stacks": {},
+                    "allowed_bedrock_regions": ["us-east-1"],
+                },
+                "monitoring": {"enabled": True},
+                "quota": rebuilt["quota"],
+            },
+            original.name,
+        )
+
+    result = saved["profile"]
+    for attr in TELEMETRY_DB_ATTRS:
+        assert getattr(result, attr) == getattr(original, attr), f"{attr} was lost in the save -> rebuild round trip"

@@ -1347,6 +1347,12 @@ class DeployCommand(Command):
                 monthly_cost_limit = getattr(profile, "monthly_cost_limit_usd", 0) or 0
                 daily_cost_limit = getattr(profile, "daily_cost_limit_usd", 0) or 0
 
+                # Telemetry database: the authoritative per-user usage source.
+                # quota_monitor reads month-to-date cost/tokens from
+                # telemetry.unified_hourly_cost rather than computing cost itself.
+                telemetry_db_secret_arn = getattr(profile, "telemetry_db_secret_arn", None) or ""
+                telemetry_db_subnet_ids = getattr(profile, "telemetry_db_subnet_ids", None) or []
+
                 params = [
                     f"MonthlyTokenLimit={monthly_limit}",
                     f"WarningThreshold80={warning_80}",
@@ -1360,7 +1366,35 @@ class DeployCommand(Command):
                     f"OidcClientId={oidc_client_id}",
                     f"EnableFinegrainedQuotas={str(enable_finegrained_quotas).lower()}",
                     f"EnableBypassDetection={str(enable_bypass_detection).lower()}",
+                    f"TelemetryDbSecretArn={telemetry_db_secret_arn}",
+                    f"TelemetryDbHost={getattr(profile, 'telemetry_db_host', None) or ''}",
+                    f"TelemetryDbPort={getattr(profile, 'telemetry_db_port', 5432)}",
+                    f"TelemetryDbName={getattr(profile, 'telemetry_db_name', None) or 'claude_telemetry'}",
+                    f"TelemetryDbSslMode={getattr(profile, 'telemetry_db_ssl_mode', None) or 'disable'}",
+                    f"TelemetryDbCaPem={getattr(profile, 'telemetry_db_ca_pem', None) or ''}",
+                    f"TelemetryDbVpcId={getattr(profile, 'telemetry_db_vpc_id', None) or ''}",
+                    # CommaDelimitedList: _convert_params_to_boto3 splits on the first
+                    # '=' only, so embedded commas survive.
+                    f"TelemetryDbSubnetIds={','.join(telemetry_db_subnet_ids)}",
+                    f"TelemetryDbEgressCidr={getattr(profile, 'telemetry_db_egress_cidr', None) or ''}",
+                    f"QuotaWriteMode={getattr(profile, 'quota_write_mode', None) or 'shadow'}",
+                    f"QuotaDbMinRowRatio={getattr(profile, 'quota_db_min_row_ratio', 0.5)}",
                 ]
+
+                if not telemetry_db_secret_arn:
+                    console.print(
+                        "[yellow]⚠ No telemetry database configured (telemetry_db_secret_arn).[/yellow]\n"
+                        "[dim]quota_monitor reads per-user cost from the telemetry database. Without it, "
+                        "usage counters will not be updated and every run will report an error. "
+                        "Set it via [/dim][cyan]ccwb init[/cyan][dim] and redeploy.[/dim]"
+                    )
+                elif not telemetry_db_subnet_ids:
+                    console.print(
+                        "[yellow]⚠ Telemetry database configured but no subnets given "
+                        "(telemetry_db_subnet_ids).[/yellow]\n"
+                        "[dim]The quota monitor will run outside the VPC and will not reach a "
+                        "private database endpoint.[/dim]"
+                    )
 
                 # Package the template using AWS CLI
                 task = progress.add_task("Packaging quota monitoring Lambda functions...", total=None)

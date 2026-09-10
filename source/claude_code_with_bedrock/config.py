@@ -111,6 +111,25 @@ class Profile:
     monthly_cost_limit_usd: float = 0.0  # Monthly $ budget per user (0 = no cost limit)
     daily_cost_limit_usd: float = 0.0  # Daily $ cap per user (0 = no daily cap)
 
+    # Telemetry database (authoritative usage source for quota_monitor).
+    # quota_monitor reads month-to-date cost and tokens per user from
+    # telemetry.unified_hourly_cost instead of computing cost itself. Without
+    # telemetry_db_secret_arn the quota monitor has no usage source and will
+    # report an error on every run.
+    telemetry_db_secret_arn: str | None = None  # Secrets Manager ARN for the DB credentials
+    telemetry_db_host: str | None = None  # Overrides the host in the secret (use a stable IP/DNS name)
+    telemetry_db_port: int = 5432
+    telemetry_db_name: str = "claude_telemetry"
+    telemetry_db_ssl_mode: str = "disable"  # "disable", "require", or "verify-full"
+    telemetry_db_ca_pem: str | None = None  # Required only for "verify-full"
+    telemetry_db_vpc_id: str | None = None  # VPC to attach the Lambda to (must reach the DB)
+    telemetry_db_subnet_ids: list[str] = field(default_factory=list)  # Private subnets with NAT egress
+    telemetry_db_egress_cidr: str | None = None  # CIDR the Lambda may open DB connections to
+    # "shadow" logs the per-user diff against DynamoDB without changing counters;
+    # "enforce" writes absolute totals. Start in shadow to compare, then cut over.
+    quota_write_mode: str = "shadow"
+    quota_db_min_row_ratio: float = 0.5  # Refuse writes if the query returns < this fraction of known users
+
     # Monitoring endpoint (saved from deploy, avoids re-reading CloudFormation outputs)
     otel_collector_endpoint: str | None = None  # OTel collector ALB endpoint URL
 

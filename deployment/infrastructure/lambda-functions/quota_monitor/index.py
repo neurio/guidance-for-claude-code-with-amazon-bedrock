@@ -1,27 +1,24 @@
 # ABOUTME: Lambda function that monitors user token quotas and sends SNS alerts
-# ABOUTME: Queries CloudWatch PromQL API for usage data, writes to DynamoDB, checks thresholds
+# ABOUTME: Reads authoritative per-user cost from TimescaleDB, writes absolute totals to DynamoDB, checks thresholds
 
 import json
 import boto3
 import os
-import urllib.request
-import urllib.parse
+import ssl
 from datetime import datetime, timezone
 from decimal import Decimal
 from boto3.dynamodb.conditions import Key, Attr
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
 
 # Initialize clients
 dynamodb = boto3.resource("dynamodb")
 sns_client = boto3.client("sns")
+secrets_client = boto3.client("secretsmanager")
 
 # Configuration from environment
 QUOTA_TABLE = os.environ.get("QUOTA_TABLE", "UserQuotaMetrics")
 POLICIES_TABLE = os.environ.get("POLICIES_TABLE")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
 ENABLE_FINEGRAINED_QUOTAS = os.environ.get("ENABLE_FINEGRAINED_QUOTAS", "false").lower() == "true"
-METRICS_REGION = os.environ.get("METRICS_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 
 # Default limits
 MONTHLY_TOKEN_LIMIT = int(os.environ.get("MONTHLY_TOKEN_LIMIT", "300000000"))
@@ -36,224 +33,320 @@ DAILY_COST_LIMIT_USD = float(os.environ.get("DAILY_COST_LIMIT_USD", "0") or 0)
 quota_table = dynamodb.Table(QUOTA_TABLE)
 policies_table = dynamodb.Table(POLICIES_TABLE) if POLICIES_TABLE else None
 
-# PromQL endpoint
-PROMQL_ENDPOINT = f"https://monitoring.{METRICS_REGION}.amazonaws.com/api/v1/query"
+# --- TimescaleDB (authoritative cost source) ---------------------------------
+# Host/port/dbname come from CFN env vars, NOT from the secret. The secret is
+# owned by another team's Terraform and its `host` key points at the instance's
+# PRIMARY private IP, which is not stable across ASG replacement. We connect to
+# a stable SECONDARY private IP on the same ENI instead. The secret's host is
+# only a fallback if the env var is empty.
+TELEMETRY_DB_HOST = os.environ.get("TELEMETRY_DB_HOST", "")
+TELEMETRY_DB_PORT = int(os.environ.get("TELEMETRY_DB_PORT", "5432") or 5432)
+TELEMETRY_DB_NAME = os.environ.get("TELEMETRY_DB_NAME", "claude_telemetry")
+TELEMETRY_DB_SECRET_ARN = os.environ.get("TELEMETRY_DB_SECRET_ARN", "")
+# The server currently reports `SHOW ssl` = off, so `require` would fail the
+# connection outright; the default is therefore `disable` (plaintext inside the
+# VPC). Flip to `verify-full` once the DB team enables TLS and provides a CA.
+TELEMETRY_DB_SSL_MODE = os.environ.get("TELEMETRY_DB_SSL_MODE", "disable").lower()
+TELEMETRY_DB_CA_PEM = os.environ.get("TELEMETRY_DB_CA_PEM", "")
+DB_CONNECT_TIMEOUT = int(os.environ.get("TELEMETRY_DB_CONNECT_TIMEOUT", "10") or 10)
+DB_STATEMENT_TIMEOUT_MS = int(os.environ.get("TELEMETRY_DB_STATEMENT_TIMEOUT_MS", "20000") or 20000)
+
+# shadow = read + compare + refresh liveness only (counters frozen).
+# enforce = write absolute totals.
+QUOTA_WRITE_MODE = os.environ.get("QUOTA_WRITE_MODE", "shadow").lower()
+
+# Safety floor: refuse to overwrite the table from a suspiciously small result.
+# With incremental ADD a bad query wrote nothing; with absolute SET it would
+# zero out real month-to-date accounting, so this guard is load-bearing.
+DB_MIN_ROW_RATIO = float(os.environ.get("QUOTA_DB_MIN_ROW_RATIO", "0.5") or 0.5)
+
+COST_SOURCE = "telemetry.unified_hourly_cost"
+
+_db_secret_cache = None
+
+# Month-to-date usage per identity, from the deduplicated unified view.
+#
+# `unified_hourly_cost` is a VIEW over the `unified_hourly` materialized view;
+# it adds cost_usd via telemetry.calculate_token_cost() plus the 1.1x
+# cross-region multiplier for `us.%` inference profiles. The matview is
+# refreshed by TimescaleDB background job `refresh_unified_rollups` on a 15
+# minute interval, matching this Lambda's schedule.
+#
+# Grain is one row per (time, user_email, organization_id, model, type,
+# account_source, cost_center_real) -- verified: 50761 rows = 50761 distinct
+# tuples MTD. So `type` is a real dimension and sum(total_tokens) is a true
+# total across types, not a double count.
+#
+# `type` carries BOTH spelling families, because the view unions two producers:
+# the Bedrock CloudTrail branch emits snake_case (input, output, cache_read,
+# cache_creation) and the OTel token_usage branch emits camelCase (cacheRead,
+# cacheCreation). Note the cache-write type is `cache_creation`/`cacheCreation`
+# -- there is no `cache_write`.
+#
+# Identity casing: we GROUP BY lower(user_email) so a future casing split
+# cannot silently divide one human's spend across two rows, but carry
+# min(user_email) as the representative original-case spelling for the
+# DynamoDB key. Verified: for all 315 identities present in both stores the
+# DB's raw casing matches the existing DynamoDB `pk` exactly, so preserving it
+# lands on existing rows and keeps quota_check / alert dedup working unchanged.
+#
+# Only email identities are counted. `unified_hourly_cost` also carries opaque
+# non-email `bedrock_user_id` values -- service principals and CI role sessions
+# -- which have no human to notify and should not receive quota rows or alerts.
+# `LIKE '%@%'` is the same identity test sidecar_monitor applies. This is a
+# deliberate accounting exclusion, not a coverage gap: that spend is still
+# visible in the telemetry DB and its dashboards, just not enforced here.
+USAGE_SQL = """
+SELECT lower(user_email)                                                      AS email_key,
+       min(user_email)                                                        AS email_display,
+       COALESCE(sum(cost_usd), 0)                                             AS monthly_cost,
+       COALESCE(sum(cost_usd) FILTER (
+           WHERE time >= date_trunc('day', now())), 0)                        AS daily_cost,
+       COALESCE(sum(total_tokens), 0)                                         AS total_tokens,
+       COALESCE(sum(total_tokens) FILTER (
+           WHERE time >= date_trunc('day', now())), 0)                        AS daily_tokens,
+       COALESCE(sum(total_tokens) FILTER (WHERE type = 'input'), 0)            AS input_tokens,
+       COALESCE(sum(total_tokens) FILTER (WHERE type = 'output'), 0)           AS output_tokens,
+       COALESCE(sum(total_tokens) FILTER (
+           WHERE type IN ('cache_read', 'cacheRead')), 0)                      AS cache_tokens
+  FROM telemetry.unified_hourly_cost
+ WHERE time >= date_trunc('month', now())
+   AND user_email IS NOT NULL
+   AND btrim(user_email) <> ''
+   AND user_email LIKE '%@%'
+ GROUP BY 1
+"""
 
 
-def _promql_query(query, time_param=None):
-    """Execute a PromQL instant query against CloudWatch Prometheus-compatible API with SigV4."""
-    data = urllib.parse.urlencode({"query": query})
-    if time_param:
-        data += f"&time={time_param}"
-    url = PROMQL_ENDPOINT
+def _db_secret():
+    """Fetch and cache the DB credentials secret (module-level cache, warm reuse)."""
+    global _db_secret_cache
+    if _db_secret_cache is None:
+        if not TELEMETRY_DB_SECRET_ARN:
+            raise RuntimeError("TELEMETRY_DB_SECRET_ARN is not configured")
+        resp = secrets_client.get_secret_value(SecretId=TELEMETRY_DB_SECRET_ARN)
+        _db_secret_cache = json.loads(resp["SecretString"])
+    return _db_secret_cache
 
-    request = AWSRequest(
-        method="POST", url=url,
-        data=data.encode("utf-8"),
-        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+
+def _ssl_context():
+    """Build the ssl_context for pg8000 per TELEMETRY_DB_SSL_MODE, or None for plaintext."""
+    if TELEMETRY_DB_SSL_MODE in ("disable", "", "off"):
+        return None
+    if TELEMETRY_DB_SSL_MODE == "verify-full":
+        if not TELEMETRY_DB_CA_PEM:
+            raise RuntimeError("TELEMETRY_DB_SSL_MODE=verify-full requires TELEMETRY_DB_CA_PEM")
+        return ssl.create_default_context(cafile=TELEMETRY_DB_CA_PEM)
+    # "require": encrypt the wire, but do NOT authenticate the server. This
+    # gives confidentiality only -- it is not MITM-resistant. Use verify-full
+    # once a server CA is available.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _db_connect():
+    """Open a TimescaleDB connection. Imported lazily so unit tests never need the driver."""
+    import pg8000.dbapi  # vendored; see VENDORED.md
+
+    secret = _db_secret()
+    host = TELEMETRY_DB_HOST or secret.get("host") or ""
+    if not host:
+        raise RuntimeError("No telemetry DB host configured (env TELEMETRY_DB_HOST or secret 'host')")
+
+    conn = pg8000.dbapi.connect(
+        user=secret.get("username") or secret.get("user") or "postgres",
+        password=secret["password"],
+        host=host,
+        port=TELEMETRY_DB_PORT or int(secret.get("port", 5432)),
+        database=TELEMETRY_DB_NAME or secret.get("dbname") or secret.get("database"),
+        ssl_context=_ssl_context(),
+        timeout=DB_CONNECT_TIMEOUT,
+        application_name="claude-code-quota-monitor",
     )
-    credentials = boto3.Session().get_credentials().get_frozen_credentials()
-    SigV4Auth(credentials, "monitoring", METRICS_REGION).add_auth(request)
-
-    req = urllib.request.Request(url, data=data.encode("utf-8"), headers=dict(request.headers), method="POST")
+    # pg8000.dbapi.connect() has no `options=` parameter, so the server-side
+    # statement timeout must be set as a statement after connecting. This keeps
+    # a matview-refresh contention stall from consuming the Lambda budget.
+    cur = conn.cursor()
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:500]
-        print(f"[DEBUG] HTTP {e.code}: {body}")
-        raise
-
-    if result.get("status") != "success":
-        raise RuntimeError(f"PromQL query failed: {result}")
-    return result["data"].get("result", [])
+        cur.execute(f"SET statement_timeout = {int(DB_STATEMENT_TIMEOUT_MS)}")
+        conn.commit()
+    finally:
+        cur.close()
+    return conn
 
 
-AGGREGATION_WINDOW = 900  # 15 minutes in seconds (matches EventBridge schedule)
+def fetch_usage_from_db(conn_factory=None):
+    """Return month-to-date usage per identity from TimescaleDB.
 
-# Map the metric's `type` dimension values to pricing.py rate keys.
-# The CloudWatch `type` dimension is camelCase (input/output/cacheRead/
-# cacheCreation); the rate tables in shared/pricing.py are snake_case
-# (input/output/cache_read/cache_write). cacheCreation (cache-write) is usually
-# the majority of tokens, so a missing mapping silently drops most of the cost.
-TOKEN_TYPE_TO_RATE_KEY = {
-    "input": "input",
-    "output": "output",
-    "cacheRead": "cache_read",
-    "cacheCreation": "cache_write",
-}
+    Shape matches what the threshold pass expects:
+      {email: {total_tokens, daily_tokens, input_tokens, output_tokens,
+               cache_tokens, monthly_cost, daily_cost}}
 
+    Only email identities are returned. USAGE_SQL already filters them
+    server-side; the `"@" not in email` skip below is a second, cheap layer so
+    an edit to the SQL cannot quietly start writing quota rows for service
+    principals. Keep both.
 
-def fetch_usage_from_promql():
-    """Query PromQL for per-user token usage in the last aggregation window only.
-
-    Aggregation MUST use sum_over_time(), NOT increase(). Claude Code exports
-    ``claude_code.token.usage`` as an OpenTelemetry Counter with DELTA temporality
-    by default (OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta): each
-    datapoint is the tokens emitted since the last export, so the series steps up
-    AND down (a sawtooth). increase() assumes CUMULATIVE temporality (a monotonic
-    running total) and reads every down-step as a counter reset — it returns empty
-    or wildly understated results, which froze DynamoDB and surfaced as
-    "Daily Tokens: 0" in `ccwb quota usage`. sum_over_time() sums the per-interval
-    deltas in the window = tokens used in the last 15 minutes, matching how the
-    Athena/CloudWatch consumers compute usage.
-
-    Coupling: this is correct only while the metric is exported with delta
-    temporality. If a deployment sets the temporality preference to `cumulative`,
-    increase() would become the correct function instead.
+    `conn_factory` is the unit-test seam -- inject a fake connection so tests
+    never touch a live database. Raises on any failure; the caller decides
+    whether that aborts the write step (it does -- see lambda_handler).
     """
-    window = AGGREGATION_WINDOW
-
-    # Delta tokens per user in the last window
-    results = _promql_query(
-        f'sum by ("user.email")(sum_over_time({{"claude_code.token.usage"}}[{window}s]))'
-    )
-
-    # Delta token type AND model breakdown per user (for cost calculation)
-    type_model_results = _promql_query(
-        f'sum by ("user.email", type, model)(sum_over_time({{"claude_code.token.usage"}}[{window}s]))'
-    )
-
-    # Delta token type breakdown per user (without model, for backward compat)
-    type_results = _promql_query(
-        f'sum by ("user.email", type)(sum_over_time({{"claude_code.token.usage"}}[{window}s]))'
-    )
-
+    conn = (conn_factory or _db_connect)()
     users = {}
-    for r in results:
-        email = r["metric"].get("user.email", "")
-        val = float(r["value"][1])
-        if email and val > 0:
-            users[email] = {"total_tokens": val}
-
-    for r in type_results:
-        email = r["metric"].get("user.email", "")
-        token_type = r["metric"].get("type", "")
-        val = float(r["value"][1])
-        if email and val > 0:
-            u = users.setdefault(email, {})
-            if token_type == "input":
-                u["input_tokens"] = val
-            elif token_type == "output":
-                u["output_tokens"] = val
-            elif token_type in ("cache_read", "cacheRead"):
-                u["cache_tokens"] = val
-
-    # Calculate per-user cost from model-aware token breakdown
+    skipped_non_email = 0
     try:
-        import sys
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-        from shared.pricing import calculate_cost, resolve_model_family, get_rates
+        cur = conn.cursor()
+        try:
+            cur.execute(USAGE_SQL)
+            for row in cur.fetchall():
+                (email_key, email_display, monthly_cost, daily_cost,
+                 total_tokens, daily_tokens, input_tokens, output_tokens, cache_tokens) = row[:9]
+                email = (email_display or email_key or "").strip()
+                if not email or len(email) > 320:
+                    continue
+                if "@" not in email:
+                    skipped_non_email += 1
+                    continue
+                users[email] = {
+                    "total_tokens": float(total_tokens or 0),
+                    "daily_tokens": float(daily_tokens or 0),
+                    "input_tokens": float(input_tokens or 0),
+                    "output_tokens": float(output_tokens or 0),
+                    "cache_tokens": float(cache_tokens or 0),
+                    "monthly_cost": float(monthly_cost or 0),
+                    "daily_cost": float(daily_cost or 0),
+                }
+        finally:
+            cur.close()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-        rates = get_rates()
-        for r in type_model_results:
-            email = r["metric"].get("user.email", "")
-            token_type = r["metric"].get("type", "")
-            model = r["metric"].get("model", "")
-            val = float(r["value"][1])
-            if email and val > 0 and token_type and model:
-                u = users.setdefault(email, {})
-                family = resolve_model_family(model)
-                family_rates = rates.get(family, rates.get("sonnet", {}))
-                rate = family_rates.get(TOKEN_TYPE_TO_RATE_KEY.get(token_type, token_type), 0)
-                cost_delta = (val / 1_000_000) * rate
-                u["cost_usd"] = u.get("cost_usd", 0) + cost_delta
-    except Exception as e:
-        # Cost calculation is optional — don't fail the whole run
-        print(f"Cost calculation skipped (non-fatal): {e}")
-
-    print(f"Fetched delta usage for {len(users)} users from PromQL ({window}s window)")
-
-    # Also fetch CoWork 3P token usage (separate namespace, MetricFilter-derived).
-    # CoWork events are logged to /aws/claude-cowork/events and MetricFilters extract
-    # per-user metrics into the ClaudeCoWork namespace with user_email dimension.
-    # This ensures CoWork token consumption counts toward the same quota as Claude Code.
-    try:
-        # CoWork metrics are MetricFilter-derived per-event token counts (delta,
-        # not cumulative) — use sum_over_time() for the same reason as above.
-        cowork_input = _promql_query(
-            f'sum by ("user_email", "model")(sum_over_time({{"ClaudeCoWork","token.usage.input"}}[{window}s]))'
-        )
-        cowork_output = _promql_query(
-            f'sum by ("user_email", "model")(sum_over_time({{"ClaudeCoWork","token.usage.output"}}[{window}s]))'
-        )
-        cowork_count = 0
-        for r in cowork_input + cowork_output:
-            email = r["metric"].get("user_email", "")
-            model = r["metric"].get("model", "")
-            val = float(r["value"][1])
-            if email and val > 0:
-                u = users.setdefault(email, {"total_tokens": 0})
-                u["total_tokens"] = u.get("total_tokens", 0) + val
-                # Calculate cost if model dimension is available
-                if model:
-                    try:
-                        family = resolve_model_family(model)
-                        family_rates = rates.get(family, rates.get("sonnet", {}))
-                        # Determine token type from metric name
-                        metric_name = r["metric"].get("__name__", "")
-                        if "input" in metric_name:
-                            rate = family_rates.get("input", 3.0)
-                        else:
-                            rate = family_rates.get("output", 15.0)
-                        u["cost_usd"] = u.get("cost_usd", 0) + (val / 1_000_000) * rate
-                    except Exception:
-                        pass
-                cowork_count += 1
-        if cowork_count > 0:
-            print(f"Added CoWork 3P usage for {cowork_count} user-metric pairs")
-    except Exception as e:
-        # CoWork metrics are optional — don't fail quota monitoring if unavailable
-        print(f"CoWork PromQL query skipped (non-fatal): {e}")
-
+    # A non-zero skip count means the SQL filter stopped matching -- worth
+    # noticing in logs, because the guard is the only thing holding the line.
+    print(f"Fetched MTD usage for {len(users)} email identities from {COST_SOURCE} "
+          f"({skipped_non_email} non-email identities skipped client-side)")
     return users
 
 
-def update_quota_metrics(usage_data):
-    """Atomically increment UserQuotaMetrics with delta from PromQL (like old MetricsAggregator)."""
+def _write_is_safe(row_count, existing_count):
+    """Guard absolute overwrites against a truncated or empty query result."""
+    if row_count <= 0:
+        print("ERROR: telemetry DB returned 0 identities - refusing to overwrite quota counters")
+        return False
+    if existing_count > 0 and row_count < existing_count * DB_MIN_ROW_RATIO:
+        print(f"ERROR: telemetry DB returned {row_count} identities vs {existing_count} "
+              f"existing rows (< {DB_MIN_ROW_RATIO:.0%}) - refusing to overwrite quota counters")
+        return False
+    return True
+
+
+def _month_end_ttl(now):
+    """Expire the item at 00:00 UTC on the first day of the following month.
+
+    Anchoring on day=1 is what makes this correct for every month. The obvious
+    day=28 variant skips a month for January in non-leap years -- Jan 28 + 32d
+    lands on Mar 1 -- which doubled the intended lifetime of January rows.
+
+    Zeroing the time fields keeps the value stable across invocations. Without
+    it the ttl inherited the Lambda's run time-of-day, so a row rewritten every
+    15 minutes carried a different expiry on every write.
+    """
+    import datetime as _dt
+    first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return int((first + _dt.timedelta(days=32)).replace(day=1).timestamp())
+
+
+def write_usage_absolute(usage_data, shadow=False):
+    """Write absolute month-to-date totals to DynamoDB (idempotent).
+
+    Replaces the old incremental `ADD` accumulator. Because every value is the
+    complete month-to-date total from the source of truth, this is idempotent:
+    running it twice produces the same item, and a missed or retried invocation
+    self-heals on the next run instead of permanently skewing the counter.
+
+    `daily_*` needs no read-modify-write day-rollover dance either -- the SQL
+    FILTER already scopes it to today, and daily_date is always stamped to
+    today, so the stale-day guard in _build_usage_entry becomes a no-op for
+    freshly written users while still protecting untouched legacy rows.
+
+    In shadow mode only the liveness attributes are written: counters stay
+    frozen, but `last_updated` keeps advancing so sidecar_monitor does not
+    raise false "sidecar stopped" alerts.
+    """
     now = datetime.now(timezone.utc)
     current_month = now.strftime("%Y-%m")
     current_date = now.strftime("%Y-%m-%d")
-    ttl = int((now.replace(day=28) + __import__("datetime").timedelta(days=32)).replace(day=1).timestamp())
+    ttl = _month_end_ttl(now)
+    ts = now.isoformat().replace("+00:00", "Z")  # sidecar_monitor parses this format
 
+    written = 0
+    errors = 0
     for email, usage in usage_data.items():
-        delta = usage.get("total_tokens", 0)
-        if delta <= 0:
-            continue
         try:
-            # Check if daily_date changed (new day = reset daily counter)
-            response = quota_table.get_item(Key={"pk": f"USER#{email}", "sk": f"MONTH#{current_month}"})
-            existing = response.get("Item", {})
-            daily_reset = existing.get("daily_date") != current_date
-
-            update_expr = "ADD total_tokens :delta, input_tokens :inp, output_tokens :out, cache_tokens :cache, estimated_cost :cost"
-            cost_delta = usage.get("cost_usd", 0)
-            expr_values = {
-                ":delta": Decimal(str(int(delta))),
-                ":inp": Decimal(str(int(usage.get("input_tokens", 0)))),
-                ":out": Decimal(str(int(usage.get("output_tokens", 0)))),
-                ":cache": Decimal(str(int(usage.get("cache_tokens", 0)))),
-                ":cost": Decimal(str(round(cost_delta, 6))),
-                ":ts": now.isoformat().replace("+00:00", "Z"),
-                ":ttl": ttl,
-                ":email": email,
-            }
-            if daily_reset:
-                update_expr += " SET daily_tokens = :delta, daily_cost_usd = :cost, daily_date = :date, last_updated = :ts, #ttl = :ttl, email = :email"
-                expr_values[":date"] = current_date
+            if shadow:
+                update_expr = "SET last_updated = :ts, #ttl = :ttl, email = :email"
+                expr_values = {":ts": ts, ":ttl": ttl, ":email": email}
             else:
-                update_expr += ", daily_tokens :delta, daily_cost_usd :cost SET last_updated = :ts, #ttl = :ttl, email = :email"
-
+                update_expr = (
+                    "SET total_tokens = :tt, input_tokens = :inp, output_tokens = :out, "
+                    "cache_tokens = :cache, estimated_cost = :cost, "
+                    "daily_tokens = :dt, daily_cost_usd = :dcost, daily_date = :date, "
+                    "last_updated = :ts, #ttl = :ttl, email = :email, cost_source = :src"
+                )
+                expr_values = {
+                    ":tt": Decimal(str(int(usage.get("total_tokens", 0)))),
+                    ":inp": Decimal(str(int(usage.get("input_tokens", 0)))),
+                    ":out": Decimal(str(int(usage.get("output_tokens", 0)))),
+                    ":cache": Decimal(str(int(usage.get("cache_tokens", 0)))),
+                    ":cost": Decimal(str(round(float(usage.get("monthly_cost", 0)), 6))),
+                    ":dt": Decimal(str(int(usage.get("daily_tokens", 0)))),
+                    ":dcost": Decimal(str(round(float(usage.get("daily_cost", 0)), 6))),
+                    ":date": current_date,
+                    ":ts": ts,
+                    ":ttl": ttl,
+                    ":email": email,
+                    ":src": COST_SOURCE,
+                }
             quota_table.update_item(
                 Key={"pk": f"USER#{email}", "sk": f"MONTH#{current_month}"},
                 UpdateExpression=update_expr,
                 ExpressionAttributeNames={"#ttl": "ttl"},
                 ExpressionAttributeValues=expr_values,
             )
+            written += 1
         except Exception as e:
+            errors += 1
             print(f"Error updating quota for {email}: {e}")
 
-    print(f"Updated UserQuotaMetrics for {len(usage_data)} users")
+    mode = "shadow (counters frozen)" if shadow else "absolute"
+    print(f"Wrote {written} UserQuotaMetrics items in {mode} mode ({errors} errors)")
+    return written
+
+
+def _log_shadow_diff(db_usage, existing):
+    """Log what the cutover would change, without changing it."""
+    db_total = sum(v.get("monthly_cost", 0) for v in db_usage.values())
+    ddb_total = sum(v.get("monthly_cost", 0) for v in existing.values())
+    matched = [e for e in db_usage if e in existing]
+    new_users = [e for e in db_usage if e not in existing]
+    missing = [e for e in existing if e not in db_usage]
+    print(f"SHADOW: identities db={len(db_usage)} ddb={len(existing)} "
+          f"matched={len(matched)} new={len(new_users)} ddb_only={len(missing)}")
+    print(f"SHADOW: MTD cost db=${db_total:,.2f} ddb=${ddb_total:,.2f} "
+          f"delta=${db_total - ddb_total:,.2f}")
+    deltas = sorted(
+        ((db_usage[e]["monthly_cost"] - existing[e]["monthly_cost"], e) for e in matched),
+        key=lambda t: -abs(t[0]),
+    )
+    for d, e in deltas[:10]:
+        print(f"SHADOW:   {d:+12,.2f}  {existing[e]['monthly_cost']:>10,.2f} -> "
+              f"{db_usage[e]['monthly_cost']:>10,.2f}  {e}")
+
 
 
 def _build_usage_entry(item, current_date):
@@ -281,8 +374,12 @@ def _build_usage_entry(item, current_date):
 
 
 def lambda_handler(event, context):
-    """Fetch usage from PromQL, update DynamoDB, check quotas, send alerts."""
+    """Read MTD usage from TimescaleDB, write absolute totals to DynamoDB, check quotas, alert."""
     print(f"Starting quota monitoring at {datetime.now(timezone.utc).isoformat()}")
+    shadow = QUOTA_WRITE_MODE != "enforce"
+    if shadow:
+        print("WARNING: QUOTA_WRITE_MODE=shadow - quota counters are FROZEN "
+              "(reading and comparing only). Set QUOTA_WRITE_MODE=enforce to write.")
 
     now = datetime.now(timezone.utc)
     month_name = now.strftime("%B %Y")
@@ -290,14 +387,13 @@ def lambda_handler(event, context):
     days_in_month = (31 if now.month in [1, 3, 5, 7, 8, 10, 12]
                      else (30 if now.month != 2 else (29 if now.year % 4 == 0 else 28)))
     days_remaining = days_in_month - now.day
+    db_failed = False
 
     try:
-        # Step 1: Fetch delta usage from PromQL and increment DynamoDB
-        delta_data = fetch_usage_from_promql()
-        if delta_data:
-            update_quota_metrics(delta_data)
-
-        # Step 2: Read cumulative totals from DynamoDB for threshold checking
+        # Step 1: Read existing DynamoDB totals FIRST. This serves two purposes:
+        # it is the threshold-checking baseline (and keeps users who exist here
+        # but not in the DB result being alerted on), and its row count is the
+        # denominator for the safety floor that guards absolute overwrites.
         current_month = now.strftime("%Y-%m")
         usage_data = {}
         # NOTE: daily_date MUST be projected so we can apply the same stale-day
@@ -323,10 +419,51 @@ def lambda_handler(event, context):
                 email = item.get("email")
                 if email:
                     usage_data[email] = _build_usage_entry(item, current_date)
+        existing_count = len(usage_data)
+
+        # Step 2: Read authoritative MTD usage from TimescaleDB and write it.
+        # Unlike the old optional cost calculation, the DB IS the cost source
+        # now, so a failure here is an error - not a non-fatal skip. We still
+        # fall through to threshold checking on the DynamoDB values we already
+        # have, but we never write a partial or truncated result.
+        if not TELEMETRY_DB_SECRET_ARN:
+            db_failed = True
+            print("ERROR: TELEMETRY_DB_SECRET_ARN is not configured - no cost source available")
+        else:
+            try:
+                db_usage = fetch_usage_from_db()
+                if not _write_is_safe(len(db_usage), existing_count):
+                    db_failed = True
+                    _publish_operational_alert(
+                        "Claude Code quota monitor refused to write",
+                        f"TimescaleDB returned {len(db_usage)} identities vs {existing_count} "
+                        f"existing DynamoDB rows, below the {DB_MIN_ROW_RATIO:.0%} safety floor. "
+                        f"Quota counters were left untouched.",
+                    )
+                else:
+                    if shadow:
+                        _log_shadow_diff(db_usage, usage_data)
+                    write_usage_absolute(db_usage, shadow=shadow)
+                    if not shadow:
+                        # Alert on the same-run fresh values. This also removes
+                        # the read-after-write race the old code had (ADD, then
+                        # eventually-consistent Scan).
+                        for email, u in db_usage.items():
+                            usage_data[email] = {
+                                "total_tokens": u.get("total_tokens", 0),
+                                "daily_tokens": u.get("daily_tokens", 0),
+                                "monthly_cost": u.get("monthly_cost", 0),
+                                "daily_cost": u.get("daily_cost", 0),
+                            }
+            except Exception as e:
+                db_failed = True
+                print(f"ERROR: telemetry DB read failed, quota counters left untouched: {e}")
+                import traceback
+                traceback.print_exc()
 
         if not usage_data:
             print("No usage data in DynamoDB")
-            return {"statusCode": 200, "body": "No usage data"}
+            return {"statusCode": 500 if db_failed else 200, "body": "No usage data"}
 
         # Step 3: Load policies
         policies_cache = {}
@@ -339,6 +476,12 @@ def lambda_handler(event, context):
         # Step 4: Check each user against quotas
         alerts_to_send = []
         stats = {"total_users": 0, "over_80": 0, "over_90": 0, "exceeded": 0, "daily_exceeded": 0}
+        # Which dimension the counters above were measured against. In cost mode the
+        # token limits are 0 (disabled), so counting tokens printed 0/0/0 no matter how
+        # far over budget anyone was -- a summary line an operator would reasonably
+        # trust. Count whichever limit is actually enforced, and say which one it was.
+        bases = set()
+        monthly_cost_total = 0.0
 
         for email, usage in usage_data.items():
             stats["total_users"] += 1
@@ -348,22 +491,42 @@ def lambda_handler(event, context):
 
             total_tokens = usage.get("total_tokens", 0)
             daily_tokens = usage.get("daily_tokens", 0)
+            monthly_cost = usage.get("monthly_cost", 0)
+            daily_cost = usage.get("daily_cost", 0)
+            monthly_cost_total += float(monthly_cost or 0)
 
             alerts = check_limits_and_generate_alerts(
                 email=email, total_tokens=total_tokens, daily_tokens=daily_tokens,
                 policy=policy, month_name=month_name, current_date=current_date,
                 days_remaining=days_remaining, days_in_month=days_in_month, sent_alerts=sent_alerts,
-                monthly_cost=usage.get("monthly_cost", 0), daily_cost=usage.get("daily_cost", 0),
+                monthly_cost=monthly_cost, daily_cost=daily_cost,
             )
 
-            monthly_pct = (total_tokens / policy["monthly_token_limit"]) * 100 if policy["monthly_token_limit"] > 0 else 0
+            # Same precedence as check_limits_and_generate_alerts: a $ budget, if set,
+            # is the limit that matters; tokens are the fallback for token-mode stacks.
+            monthly_cost_limit = float(policy.get("monthly_cost_limit", 0) or 0)
+            monthly_token_limit = policy["monthly_token_limit"]
+            if monthly_cost_limit > 0:
+                bases.add("cost")
+                monthly_pct = (float(monthly_cost or 0) / monthly_cost_limit) * 100
+            elif monthly_token_limit > 0:
+                bases.add("tokens")
+                monthly_pct = (total_tokens / monthly_token_limit) * 100
+            else:
+                monthly_pct = 0
+
             if monthly_pct > 100:
                 stats["exceeded"] += 1
             elif monthly_pct > 90:
                 stats["over_90"] += 1
             elif monthly_pct > 80:
                 stats["over_80"] += 1
-            if policy.get("daily_token_limit") and daily_tokens > policy["daily_token_limit"]:
+
+            daily_cost_limit = float(policy.get("daily_cost_limit", 0) or 0)
+            if daily_cost_limit > 0:
+                if float(daily_cost or 0) > daily_cost_limit:
+                    stats["daily_exceeded"] += 1
+            elif policy.get("daily_token_limit") and daily_tokens > policy["daily_token_limit"]:
                 stats["daily_exceeded"] += 1
 
             for alert in alerts:
@@ -376,8 +539,26 @@ def lambda_handler(event, context):
             send_alerts(alerts_to_send)
             print(f"Sent {len(alerts_to_send)} alerts")
 
-        print(f"Summary - Total: {stats['total_users']}, Over 80%: {stats['over_80']}, Over 90%: {stats['over_90']}, Exceeded: {stats['exceeded']}")
-        return {"statusCode": 200, "body": json.dumps(stats)}
+        if bases == {"cost"}:
+            basis = "cost"
+        elif bases == {"tokens"}:
+            basis = "tokens"
+        elif bases:
+            basis = "mixed"
+        else:
+            basis = "no limits set"
+        stats["limit_basis"] = basis
+        stats["monthly_cost_total"] = round(monthly_cost_total, 2)
+
+        print(f"Summary ({basis}) - Total: {stats['total_users']}, Over 80%: {stats['over_80']}, "
+              f"Over 90%: {stats['over_90']}, Exceeded: {stats['exceeded']}, "
+              f"Daily exceeded: {stats['daily_exceeded']}, MTD: ${monthly_cost_total:,.2f}")
+        stats["cost_source"] = COST_SOURCE
+        stats["write_mode"] = "shadow" if shadow else "enforce"
+        stats["db_failed"] = db_failed
+        # Surface a cost-source failure as an invocation error so it is visible
+        # in the Lambda Errors metric, even though thresholds were still checked.
+        return {"statusCode": 500 if db_failed else 200, "body": json.dumps(stats)}
 
     except Exception as e:
         print(f"Error: {e}")
@@ -386,41 +567,58 @@ def lambda_handler(event, context):
         return {"statusCode": 500, "body": json.dumps(f"Error: {e}")}
 
 
+def _publish_operational_alert(subject, message):
+    """Publish an operator-facing alert (distinct from per-user quota alerts)."""
+    if not SNS_TOPIC_ARN:
+        print(f"SNS_TOPIC_ARN not configured; would have alerted: {subject}")
+        return
+    try:
+        sns_client.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message)
+    except Exception as e:
+        print(f"Error publishing operational alert: {e}")
+
+
+def _policy_from_item(item):
+    """Map one QuotaPolicies item to the policy dict resolve_user_quota expects.
+
+    Every scan page must go through this. The pagination loop below used to build
+    its own copy of this dict and had silently omitted the two cost limits, so any
+    policy that happened to land on page 2+ came back with a $0 budget -- i.e.
+    unenforced, for some users and not others depending on scan ordering.
+
+    Cost limits are written by a separate update_item in the CLI
+    (`_write_cost_limits`), so they can be absent on an otherwise valid policy;
+    `or 0` keeps a null from raising here.
+    """
+    return {
+        "policy_type": item.get("policy_type"), "identifier": item.get("identifier"),
+        "monthly_token_limit": int(item.get("monthly_token_limit", 0)),
+        "daily_token_limit": int(item.get("daily_token_limit", 0)) if item.get("daily_token_limit") else None,
+        "monthly_cost_limit": float(item.get("monthly_cost_limit", 0) or 0),
+        "daily_cost_limit": float(item.get("daily_cost_limit", 0) or 0),
+        "warning_threshold_80": int(item.get("warning_threshold_80", 0)),
+        "warning_threshold_90": int(item.get("warning_threshold_90", 0)),
+        "enforcement_mode": item.get("enforcement_mode", "alert"),
+        "enabled": item.get("enabled", True),
+    }
+
+
 def load_all_policies():
     """Load all quota policies from QuotaPolicies table."""
     policies = {}
     if not policies_table:
         return policies
     try:
-        response = policies_table.scan(FilterExpression=Attr("sk").eq("CURRENT"))
-        for item in response.get("Items", []):
-            pt, ident = item.get("policy_type"), item.get("identifier")
-            if pt and ident:
-                policies[f"{pt}:{ident}"] = {
-                    "policy_type": pt, "identifier": ident,
-                    "monthly_token_limit": int(item.get("monthly_token_limit", 0)),
-                    "daily_token_limit": int(item.get("daily_token_limit", 0)) if item.get("daily_token_limit") else None,
-                    "monthly_cost_limit": float(item.get("monthly_cost_limit", 0) or 0),
-                    "daily_cost_limit": float(item.get("daily_cost_limit", 0) or 0),
-                    "warning_threshold_80": int(item.get("warning_threshold_80", 0)),
-                    "warning_threshold_90": int(item.get("warning_threshold_90", 0)),
-                    "enforcement_mode": item.get("enforcement_mode", "alert"),
-                    "enabled": item.get("enabled", True),
-                }
-        while "LastEvaluatedKey" in response:
-            response = policies_table.scan(FilterExpression=Attr("sk").eq("CURRENT"), ExclusiveStartKey=response["LastEvaluatedKey"])
+        scan_kwargs = {"FilterExpression": Attr("sk").eq("CURRENT")}
+        while True:
+            response = policies_table.scan(**scan_kwargs)
             for item in response.get("Items", []):
                 pt, ident = item.get("policy_type"), item.get("identifier")
                 if pt and ident:
-                    policies[f"{pt}:{ident}"] = {
-                        "policy_type": pt, "identifier": ident,
-                        "monthly_token_limit": int(item.get("monthly_token_limit", 0)),
-                        "daily_token_limit": int(item.get("daily_token_limit", 0)) if item.get("daily_token_limit") else None,
-                        "warning_threshold_80": int(item.get("warning_threshold_80", 0)),
-                        "warning_threshold_90": int(item.get("warning_threshold_90", 0)),
-                        "enforcement_mode": item.get("enforcement_mode", "alert"),
-                        "enabled": item.get("enabled", True),
-                    }
+                    policies[f"{pt}:{ident}"] = _policy_from_item(item)
+            if "LastEvaluatedKey" not in response:
+                break
+            scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
     except Exception as e:
         print(f"Error loading policies: {e}")
     return policies

@@ -218,6 +218,91 @@ def _write_cost_limits(
         )
 
 
+def _next_month_start_ttl(now: datetime) -> int:
+    """Epoch seconds for 00:00 UTC on the first day of the month after `now`.
+
+    Args:
+        now: Reference time. Naive values are interpreted as UTC.
+
+    Returns:
+        Unix timestamp in SECONDS (DynamoDB TTL rejects milliseconds -- an item
+        stamped in ms would outlive the account by ~50,000 years).
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # Anchoring on day=1 before adding is what makes this correct for every
+    # month: the longest month is 31 days, so day 1 + 32 days always lands
+    # inside the following month, never skipping past it.
+    return int((first_of_month + timedelta(days=32)).replace(day=1).timestamp())
+
+
+def _write_policy_ttl(
+    manager: QuotaPolicyManager,
+    policy_type: PolicyType,
+    identifier: str,
+    expires_month_end: bool,
+    now: datetime | None = None,
+) -> int | None:
+    """Stamp or clear the DynamoDB TTL attribute on a policy item.
+
+    The flag is authoritative on every run: passing it sets an expiry, omitting
+    it REMOVEs any expiry left by an earlier run. Without the removal an admin
+    who re-ran the command to raise a budget -- expecting it to stick -- would
+    watch the policy silently vanish at the month boundary.
+
+    Only user policies are ever stamped. A `ttl` on the default or a group
+    policy would delete quota enforcement for everyone it covers.
+
+    Args:
+        manager: QuotaPolicyManager instance.
+        policy_type: Policy type. Must be PolicyType.USER when stamping.
+        identifier: Policy identifier.
+        expires_month_end: True to expire after the current month, False to clear.
+        now: Reference time for the expiry calculation (defaults to now, UTC).
+
+    Returns:
+        The epoch-seconds expiry that was written, or None if TTL was cleared.
+
+    Raises:
+        ValueError: If asked to stamp a non-user policy.
+    """
+    pk = manager._make_pk(policy_type, identifier)
+
+    if not expires_month_end:
+        manager.table.update_item(
+            Key={"pk": pk, "sk": "CURRENT"},
+            UpdateExpression="REMOVE #ttl",
+            ExpressionAttributeNames={"#ttl": "ttl"},
+        )
+        return None
+
+    if policy_type != PolicyType.USER:
+        raise ValueError(f"--expires-month-end is only valid for user policies, got {policy_type.value}")
+
+    ttl = _next_month_start_ttl(now or datetime.now(timezone.utc))
+    manager.table.update_item(
+        Key={"pk": pk, "sk": "CURRENT"},
+        UpdateExpression="SET #ttl = :ttl",
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={":ttl": ttl},
+    )
+    return ttl
+
+
+def _print_ttl_notice(console, ttl: int | None) -> None:
+    """Report a stamped expiry, including the deletion lag admins should expect."""
+    if not ttl:
+        return
+    expires = datetime.fromtimestamp(ttl, tz=timezone.utc)
+    console.print(f"  Expires: {expires.strftime('%Y-%m-%d %H:%M UTC')} (temporary override)")
+    console.print(
+        "[dim]  DynamoDB TTL deletion is best-effort and can lag up to ~48h. The policy "
+        "stays in force until the item is actually removed.[/dim]"
+    )
+
+
 class QuotaCommand(Command):
     """Manage quota policies."""
 
@@ -276,6 +361,12 @@ class QuotaSetCommand(Command):
         option("enforcement", "e", description="Enforcement mode: 'alert' (default) or 'block'", flag=False),
         option("daily-enforcement", None, description="Daily enforcement mode: 'alert' or 'block'", flag=False),
         option("disabled", None, description="Create policy in disabled state", flag=True),
+        option(
+            "expires-month-end",
+            None,
+            description="Delete this policy after the current month (users only)",
+            flag=True,
+        ),
     ]
 
     def handle(self) -> int:
@@ -283,9 +374,17 @@ class QuotaSetCommand(Command):
         identifier = self.argument("identifier")
         is_group = self.option("group")
         is_default = self.option("default")
+        expires_month_end = self.option("expires-month-end")
 
         if is_default and is_group:
             self.line("<error>Cannot use both --default and --group</error>")
+            return 1
+
+        # Refuse rather than drop the flag: an admin who asked for a temporary
+        # policy must not end up with a permanent one.
+        if expires_month_end and (is_group or is_default):
+            scope = "group" if is_group else "default"
+            self.line(f"<error>--expires-month-end is only valid for user policies, not --{scope}</error>")
             return 1
 
         # Build option args to pass through
@@ -306,6 +405,8 @@ class QuotaSetCommand(Command):
                 pass_opts.append(f"--{opt_name}={val}")
         if self.option("disabled"):
             pass_opts.append("--disabled")
+        if expires_month_end:
+            pass_opts.append("--expires-month-end")
 
         opts_str = " ".join(pass_opts)
 
@@ -349,6 +450,11 @@ class QuotaSetUserCommand(Command):
         option("enforcement", "e", description="Monthly enforcement mode: 'alert' (default) or 'block'", flag=False),
         option("daily-enforcement", description="Daily enforcement mode: 'alert' (default) or 'block'", flag=False),
         option("disabled", description="Create policy in disabled state", flag=True),
+        option(
+            "expires-month-end",
+            description="Delete this policy after the current month (temporary override)",
+            flag=True,
+        ),
     ]
 
     def handle(self) -> int:
@@ -435,6 +541,8 @@ class QuotaSetUserCommand(Command):
             if daily_cost_limit is None and daily_budget_val:
                 return 1
 
+        expires_month_end = self.option("expires-month-end")
+
         try:
             manager = _get_quota_manager(profile)
             policy = manager.create_policy(
@@ -449,6 +557,8 @@ class QuotaSetUserCommand(Command):
             # Write cost limits directly to DynamoDB if provided
             if monthly_cost_limit or daily_cost_limit:
                 _write_cost_limits(manager, PolicyType.USER, email, monthly_cost_limit, daily_cost_limit)
+            # Fresh item, so nothing to clear -- only stamp when asked.
+            ttl = _write_policy_ttl(manager, PolicyType.USER, email, expires_month_end) if expires_month_end else None
             console.print(f"[green]Created user quota policy for {email}[/green]")
             console.print(f"  Monthly limit: {_format_tokens(policy.monthly_token_limit)}")
             if policy.daily_token_limit:
@@ -465,6 +575,7 @@ class QuotaSetUserCommand(Command):
             console.print(
                 f"  Enforcement: {policy.enforcement_mode.value} (monthly), {policy.daily_enforcement_mode.value} (daily)"
             )
+            _print_ttl_notice(console, ttl)
             return 0
 
         except PolicyAlreadyExistsError:
@@ -481,6 +592,9 @@ class QuotaSetUserCommand(Command):
                 )
                 if monthly_cost_limit or daily_cost_limit:
                     _write_cost_limits(manager, PolicyType.USER, email, monthly_cost_limit, daily_cost_limit)
+                # Always reconcile: the flag's absence must clear an expiry left
+                # by an earlier run, or this update would silently inherit it.
+                ttl = _write_policy_ttl(manager, PolicyType.USER, email, expires_month_end)
                 console.print(f"[yellow]Updated existing user quota policy for {email}[/yellow]")
                 console.print(f"  Monthly limit: {_format_tokens(policy.monthly_token_limit)}")
                 if policy.daily_token_limit:
@@ -492,6 +606,7 @@ class QuotaSetUserCommand(Command):
                 console.print(
                     f"  Enforcement: {policy.enforcement_mode.value} (monthly), {policy.daily_enforcement_mode.value} (daily)"
                 )
+                _print_ttl_notice(console, ttl)
                 return 0
             except QuotaPolicyError as e:
                 console.print(f"[red]Failed to update policy: {e}[/red]")
@@ -1138,33 +1253,29 @@ class QuotaUsageCommand(Command):
 
             console.print(table)
 
-            # Cost breakdown section (when cost data exists and budget is set)
+            # Token breakdown section (when cost data exists and budget is set).
+            # Deliberately no per-line dollar figures: cost is computed per model in
+            # the telemetry database (including the cross-region inference surcharge),
+            # so multiplying these counts by a single model's rates here would produce
+            # lines that do not sum to the authoritative Cost row above.
             if cost_is_primary and cost_usd > 0:
                 input_tokens = int(usage_data.get("input_tokens", 0))
                 output_tokens = int(usage_data.get("output_tokens", 0))
                 cache_tokens = int(usage_data.get("cache_tokens", 0))
 
-                # Bedrock rates for Claude Sonnet 4 (per 1K tokens)
-                input_rate = 0.003  # $3/1M input
-                output_rate = 0.015  # $15/1M output
-                cache_rate = 0.00030  # $0.30/1M cache read
-
-                console.print("\n[bold]Cost Breakdown[/bold]")
+                console.print("\n[bold]Token Breakdown[/bold]")
                 if input_tokens > 0:
-                    input_cost = input_tokens * input_rate / 1000
-                    console.print(f"  Input:      {_format_tokens(input_tokens)} × $3.00/1M = ${input_cost:.4f}")
+                    console.print(f"  Input:      {_format_tokens(input_tokens)}")
                 if output_tokens > 0:
-                    output_cost = output_tokens * output_rate / 1000
-                    console.print(f"  Output:     {_format_tokens(output_tokens)} × $15.00/1M = ${output_cost:.4f}")
+                    console.print(f"  Output:     {_format_tokens(output_tokens)}")
                 if cache_tokens > 0:
-                    cache_cost = cache_tokens * cache_rate / 1000
-                    console.print(f"  Cache read: {_format_tokens(cache_tokens)} × $0.30/1M = ${cache_cost:.4f}")
+                    console.print(f"  Cache read: {_format_tokens(cache_tokens)}")
 
-            # Cost disclaimer
+            # Cost provenance
             if cost_usd > 0 or monthly_cost_limit > 0:
                 console.print(
-                    "\n[dim]⚠ Cost estimates based on published Bedrock rates (Claude Sonnet 4). "
-                    "Actual billing may vary. Use AWS Cost Explorer for authoritative figures.[/dim]"
+                    "\n[dim]Cost is derived from Bedrock invocation records and may lag by up to "
+                    "15 minutes. Use AWS Cost Explorer for billing-authoritative figures.[/dim]"
                 )
 
             # Show warning if near/over quota

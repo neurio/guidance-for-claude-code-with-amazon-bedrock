@@ -449,29 +449,30 @@ CoWork uses `credential-process` for credential refresh (via the `inferenceBedro
 
 ### How CoWork usage is counted
 
-CoWork sends OTLP **log events** (not metrics) to the collector. The monitoring pipeline processes them:
+CoWork usage counts toward quota through the **same path as the Claude Code CLI**, with no CoWork-specific handling:
 
-1. CoWork sends `claude_code.api_request` log events to the OTEL collector
-2. Collector injects `user_email` from HTTP attribution headers
-3. Events are written to `/aws/claude-cowork/events` CloudWatch Logs
-4. MetricFilters extract per-user token counts into the `ClaudeCoWork` namespace (with `user_email` dimension)
-5. `quota_monitor` Lambda queries both `ClaudeCode` and `ClaudeCoWork` PromQL metrics
-6. Combined usage is aggregated into a single DynamoDB record per user
+1. CoWork calls Bedrock directly using credentials from `credential-process`, which sets the role session name to the user's email
+2. CloudTrail records every Bedrock invocation, including the `assumed-role/.../user@example.com` identity
+3. Those records land in `telemetry.bedrock_invocations` in the telemetry database, are priced per model, and roll up into `telemetry.unified_hourly_cost`
+4. Every 15 minutes the `quota_monitor` Lambda reads month-to-date cost and tokens per user from that view and writes them to DynamoDB
 
-**Result:** A user's total quota includes both Claude Code CLI and CoWork Desktop usage.
+**Result:** A user's total quota includes both Claude Code CLI and CoWork Desktop usage. Because CloudTrail is client-agnostic — `telemetry.bedrock_invocations` has no user-agent or client column — CoWork is counted automatically, and quota counting does **not** depend on the CoWork OTLP/MetricFilter pipeline being deployed.
+
+The CoWork OTLP log pipeline (`claude_code.api_request` events → `/aws/claude-cowork/events` → `ClaudeCoWork` MetricFilters) still powers the CoWork **dashboard**. It is no longer part of quota enforcement.
 
 ### Requirements for per-user CoWork quota
 
-- Monitoring stack deployed (central mode with custom domain + HTTPS, or sidecar mode with local proxy)
-- CoWork service token configured (`ccwb init` generates it)
-- Attribution headers flowing (credential-process provides `x-user-email`)
-- CoWork dashboard stack deployed (`ccwb deploy --stack cowork-dashboard`)
+- Quota monitoring stack deployed and pointed at the telemetry database
+- CoWork configured to use the `credential-process` profile, so the role session name carries the user's email
+
+The CoWork dashboard stack (`ccwb deploy --stack cowork-dashboard`), the CoWork service token, and the `x-user-email` attribution headers are still required for CoWork **dashboards**, but are no longer required for CoWork usage to count toward quota.
 
 ### Limitations
 
 - **No inline blocking:** CoWork calls Bedrock directly via AWS credentials. There is no per-request interception — enforcement happens at credential refresh boundaries only.
-- **Attribution required:** If `x-user-email` header is not configured, CoWork usage is aggregate-only and cannot be attributed to individual users for quota purposes.
-- **CoWork-native `user.id`:** The opaque hash in raw CoWork events cannot be mapped back to an email without a separate device registry.
+- **Up to 15 minutes of lag:** Usage is read from a rollup refreshed every 15 minutes, so very recent spend may not yet be reflected in a quota decision.
+- **Session-name attribution required:** If CoWork is configured with static credentials or a role session name that is not the user's email, its Bedrock usage cannot be attributed to an individual for quota purposes.
+- **CoWork-native `user.id`:** The opaque hash in raw CoWork events cannot be mapped back to an email without a separate device registry. This affects dashboards only, not quota.
 
 ## Additional Resources
 

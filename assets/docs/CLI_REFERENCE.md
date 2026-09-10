@@ -708,14 +708,38 @@ poetry run ccwb quota set-user <email> [options]
 **Options:**
 - `--monthly-limit, -m <tokens>` - Monthly token limit (supports K, M, B suffixes: 10M = 10,000,000)
 - `--daily-limit, -d <tokens>` - Daily token limit (optional)
+- `--budget, -b <usd>` - Monthly cost limit in USD (alias for `--monthly-cost-limit`)
+- `--daily-budget <usd>` - Daily cost limit in USD
 - `--enforcement, -e <mode>` - Enforcement mode: `alert` (monitor only) or `block` (deny access)
 - `--disabled` - Create policy in disabled state
+- `--expires-month-end` - Delete this policy after the current month (temporary override)
 - `--profile, -p <name>` - Configuration profile
 
 **Example:**
 ```bash
 poetry run ccwb quota set-user alice@example.com -m 5M -e block
 ```
+
+**Temporary overrides:**
+
+`--expires-month-end` stamps a DynamoDB TTL so a one-off budget raise does not
+carry into the next month:
+
+```bash
+# Raise Bill's budget to $2500 for this month only
+poetry run ccwb quota set-user bill@example.com --monthly-limit 0 --budget 2500 --expires-month-end
+```
+
+Notes:
+- The flag is authoritative on every run. Re-running **without** it clears the
+  expiry, making the policy permanent.
+- TTL deletion is best-effort and can lag up to ~48 hours past the month
+  boundary. The policy stays in force until the item is actually removed, so
+  don't use this where the exact cutover instant matters — run
+  `quota delete user <email>` instead.
+- Only user policies can expire. Group and default policies reject the flag,
+  since an expiring shared policy would silently drop enforcement for everyone
+  it covers.
 
 ### `quota set-group` - Set Group Quota
 
@@ -729,7 +753,7 @@ poetry run ccwb quota set-group <group> [options]
 - `<group>` - Group name (from OIDC groups claim)
 
 **Options:**
-- Same as `set-user`
+- Same as `set-user`, except `--expires-month-end` (user policies only)
 
 **Example:**
 ```bash

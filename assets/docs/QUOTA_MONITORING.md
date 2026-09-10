@@ -18,12 +18,12 @@ The quota monitoring system is an optional CloudFormation stack that integrates 
 
 ### Architecture Components
 
+- **Telemetry Database**: TimescaleDB holding per-invocation Bedrock records, priced per model — the authoritative usage source
 - **UserQuotaMetrics Table**: DynamoDB table storing monthly/daily usage totals with token type breakdown
 - **QuotaPolicies Table**: DynamoDB table storing fine-grained quota policies (user/group/default)
-- **Quota Monitor Lambda**: Scheduled function checking thresholds every 15 minutes
+- **Quota Monitor Lambda**: Scheduled function that reads month-to-date usage from the telemetry database, writes it to DynamoDB, and checks thresholds every 15 minutes
 - **SNS Topic**: Alert delivery to administrators
 - **EventBridge Rule**: Lambda scheduling
-- **Metrics Aggregator Integration**: Updates quota table during metric processing
 
 ## Configuration
 
@@ -39,14 +39,35 @@ Deploy using `poetry run ccwb deploy` (deploys all enabled stacks) or `poetry ru
 
 ## Cost-Based Enforcement (Recommended)
 
-Set dollar limits instead of (or alongside) token limits. Cost is calculated server-side using per-model Bedrock pricing rates.
+Set dollar limits instead of (or alongside) token limits. Cost is calculated in the telemetry database from Bedrock invocation records, not by the Lambda.
 
 ### How it works
 
-1. `quota_monitor` queries PromQL by `(user.email, type, model)` every 15 minutes
-2. Each token batch is priced using the actual model: Opus tokens × Opus rate, Sonnet tokens × Sonnet rate
-3. `cost_usd` and `daily_cost_usd` are accumulated in DynamoDB alongside raw token counts
-4. `quota_check` compares against `monthly_cost_limit` / `daily_cost_limit` from the policy
+1. Every Bedrock invocation is recorded by CloudTrail and loaded into `telemetry.bedrock_invocations`
+2. The database prices each invocation with `telemetry.calculate_token_cost()` using the invocation's actual model, applies the cross-region inference surcharge, and rolls the result into the `telemetry.unified_hourly_cost` view
+3. Every 15 minutes `quota_monitor` reads month-to-date **and** today's cost and tokens per user from that view in a single query
+4. It writes those totals to DynamoDB as absolute values (`SET`), so `estimated_cost`, `daily_cost_usd` and the token counts always equal what the database says
+5. `quota_check` compares against `monthly_cost_limit` / `daily_cost_limit` from the policy
+
+Two properties follow from step 4:
+
+- **Idempotent.** A retried, duplicated, or missed invocation cannot skew the counters — the next run restates the correct total. The previous design accumulated a rolling 15-minute PromQL delta with DynamoDB `ADD`, which had no watermark and no way to self-heal.
+- **Single source of truth.** Cost is computed once, in the database. There is no rate table in this repository and no per-consumer arithmetic to keep in sync.
+
+### Coverage
+
+Usage is derived from CloudTrail, which records every Bedrock invocation regardless of which client made it:
+
+- Claude Code CLI, CoWork Desktop, and any other Bedrock caller are counted by the same path
+- Usage is counted even if a user stops their OTEL sidecar — the gap `EnableBypassDetection` exists to *detect* is now closed for *accounting* purposes
+- Attribution requires the role session name to carry the user's email, which `credential-process` provides
+- **Only identities that look like email addresses are counted.** The database also attributes spend to opaque non-email identities — service principals and CI role sessions — and those are excluded from quota accounting on purpose: there is no human to warn and blocking one would break a pipeline. Their spend is still visible in the telemetry database and its dashboards, it just does not appear in `ccwb quota` or count against anyone's limit.
+
+From the CloudTrail cutover point (`telemetry.bedrock_source_of_truth_cutover()`) onward, Bedrock records are authoritative; before it, OTEL telemetry fills in. The two are de-duplicated per user-day so nothing is counted twice.
+
+### Freshness
+
+`unified_hourly_cost` is refreshed by a database background job every 15 minutes, and `quota_monitor` runs on the same cadence, so a quota decision can lag real spend by up to roughly 30 minutes in the worst case. Combined with credential-refresh-boundary enforcement, this is not an inline control — see [Enforcement Modes](#enforcement-modes).
 
 ### Setting cost limits
 
@@ -61,32 +82,96 @@ ccwb quota set-group engineering --daily-budget 10
 ccwb quota set-user user@company.com
 ```
 
-### Pricing rates ($/MTok)
+### Pricing rates
 
-| Model | Input | Output | Cache Read | Cache Write |
-|-------|-------|--------|------------|-------------|
-| Fable | $10.00 | $50.00 | $1.00 | $12.50 |
-| Opus | $5.00 | $25.00 | $0.50 | $6.25 |
-| Sonnet | $3.00 | $15.00 | $0.30 | $3.75 |
-| Haiku | $1.00 | $5.00 | $0.10 | $1.25 |
+Rates live in the telemetry database — in the body of
+`telemetry.calculate_token_cost(model, type, tokens)` — not in this repository. They
+are updated by replacing that function, not by redeploying the quota stack. The
+Lambda has no rate table and no pricing override environment variable.
 
-Rates are overridable via `BEDROCK_PRICING_RATES_JSON` Lambda env var.
+To see the rates in force:
+
+```sql
+SELECT pg_get_functiondef(p.oid)
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = 'telemetry' AND p.proname = 'calculate_token_cost';
+```
+
+Rates are matched per model *tier* (`%opus-5%`, `%sonnet-4-5%`, `%haiku-4-5%`, …) and
+per token type (`input`, `output`, `cache_creation`, `cache_creation_1h`,
+`cache_read`), with both the camelCase and snake_case type spellings normalized.
+Three behaviors are worth knowing:
+
+- **Non-Anthropic models cost $0.** Any model that does not match `%claude%`, `%anthropic%`, or `%instant%` returns zero rather than falling through to a Claude rate. If other teams share the Bedrock account, their spend is deliberately not attributed here.
+- **Unrecognized Claude models fall back to Sonnet rates.** A brand-new model name is priced as Sonnet until the function is updated, so watch for new model IDs.
+- **The cross-region surcharge is applied by the caller, not the function.** `calculate_token_cost` returns the base cost; the `1.1` multiplier for `us.%`-style cross-region inference profiles is applied in the view that rolls the data up. Calling the function directly gives you the base rate only.
 
 ### Handles opusplan correctly
 
-When using `opusplan` (Opus planning + Sonnet execution), each token batch includes the model dimension from OTEL. Opus tokens are priced at Opus rates, Sonnet tokens at Sonnet rates — no blending assumptions.
+Cost is priced per invocation using that invocation's `model_id`, so `opusplan`
+(Opus planning + Sonnet execution) is priced as Opus tokens at Opus rates and
+Sonnet tokens at Sonnet rates — no blending assumptions.
 
 ### Backward compatible
 
 - Cost limits default to 0 (disabled) — existing token-only deployments unaffected
 - Token limits still work independently — both can coexist
-- `cost_usd` field appears in DynamoDB on next `quota_monitor` run (ADD operation, non-breaking)
+- Existing DynamoDB items are updated in place; the attribute names (`estimated_cost`, `daily_cost_usd`, `total_tokens`, …) are unchanged, so `quota_check`, `ccwb quota`, and the dashboards need no changes
 
-> ⚠️ Cost estimates use published on-demand Bedrock rates. Actual billing may differ with committed throughput or custom agreements. Use AWS Cost Explorer for billing truth.
+> **Cutover warning:** switching from the old accumulator to absolute writes restates every user's counters in one step, and values move in *both* directions (the accumulated figures had drifted). Deploy in `shadow` mode first — see [Cutover](#cutover-shadow-mode) below.
 
-> **Why not use the client-side `claude_code.cost.usage` metric?** Claude Code emits a cost estimate natively, but it uses generic Anthropic rates (not Bedrock-specific), resets per session (not accumulated monthly), and cannot be trusted for enforcement (client-controlled). Server-side calculation from raw token counts is tamper-resistant, uses admin-configurable Bedrock rates, and aggregates across all sessions.
+> ⚠️ Cost is derived from Bedrock invocation records, not from your bill. Actual billing may differ with committed throughput or custom agreements. Use AWS Cost Explorer for billing truth.
 
-> **CoWork support:** Claude Desktop cost enforcement works when the CoWork dashboard stack is deployed with the `model` MetricFilter dimension (included by default). Requires attribution headers configured so `user_email` and `model` dimensions are present in the events.
+> **Why not use the client-side `claude_code.cost.usage` metric?** Claude Code emits a cost estimate natively, but it uses generic Anthropic rates (not Bedrock-specific), resets per session (not accumulated monthly), and cannot be trusted for enforcement (client-controlled). Deriving cost from CloudTrail invocation records is tamper-resistant and aggregates across all sessions and clients.
+
+> **CoWork support:** CoWork Desktop cost is counted automatically, because its Bedrock calls appear in CloudTrail like any other. It does **not** require the CoWork dashboard stack or the `model` MetricFilter dimension. See [COWORK_3P.md](COWORK_3P.md#how-cowork-usage-is-counted).
+
+## Telemetry Database Configuration
+
+`quota_monitor` requires a connection to the telemetry database. Without
+`TelemetryDbSecretArn` it has no usage source: counters are never updated and every
+run reports an error.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `TelemetryDbSecretArn` | *(none)* | Secrets Manager ARN holding the DB credentials. **Required.** |
+| `TelemetryDbHost` | *(from secret)* | Overrides the host in the secret. Prefer a DNS name or a stable secondary IP — an autoscaling-managed instance can change its primary private IP. |
+| `TelemetryDbPort` | `5432` | |
+| `TelemetryDbName` | `claude_telemetry` | |
+| `TelemetryDbSslMode` | `disable` | `disable`, `require`, or `verify-full`. |
+| `TelemetryDbCaPem` | *(none)* | CA bundle; required for `verify-full`. |
+| `TelemetryDbVpcId` | *(none)* | VPC to attach the Lambda to. |
+| `TelemetryDbSubnetIds` | *(none)* | Private subnets that can reach the database. |
+| `TelemetryDbEgressCidr` | *(none)* | CIDR the Lambda may open DB connections to. |
+| `QuotaWriteMode` | `shadow` | `shadow` (compare only) or `enforce` (write totals). |
+| `QuotaDbMinRowRatio` | `0.5` | Refuse to write if the query returns fewer than this fraction of the users already in DynamoDB. |
+
+Notes on the TLS default and networking:
+
+- `TelemetryDbSslMode` defaults to `disable` because a self-hosted TimescaleDB instance may be built with `ssl = off`; in that case any other value fails to connect. Confirm with `SHOW ssl;`. **When SSL is off, database traffic is unencrypted** — acceptable only within a trusted VPC. Prefer `verify-full` with a CA bundle where the server supports TLS. `require` encrypts but does **not** verify the server certificate, so it is not resistant to an active man-in-the-middle.
+- Attaching the Lambda to a VPC means its DynamoDB, SNS, and Secrets Manager calls leave through that VPC. If there are no VPC endpoints, they depend on a NAT gateway, which becomes a single point of failure for quota monitoring.
+- The connection uses a `statement_timeout` and a connect timeout well below the Lambda timeout, so a hung database surfaces as an error rather than a timeout.
+
+### Safety floor
+
+Because writes are absolute, a query that returns too few rows would zero out real
+accounting. Before writing, the Lambda compares the number of identities returned
+against the number of current-month users already in DynamoDB and refuses the whole
+batch if the ratio is below `QuotaDbMinRowRatio`, publishing an operational alert
+instead. A database error does the same. In both cases threshold checking still runs
+against the existing DynamoDB values, so alerting does not stop.
+
+### Cutover (shadow mode)
+
+`QuotaWriteMode=shadow` is the default and is where a first deployment should stay.
+
+1. Deploy with `QuotaWriteMode=shadow`. The Lambda queries the database and logs the per-user difference against the current DynamoDB values, but changes no counters. It still stamps `last_updated`, so bypass detection keeps working.
+2. Compare a few cycles. Expect movement in **both** directions: the old accumulator drifted, so some users will be higher and some lower. Investigate any user whose value changes by an implausible amount.
+3. Expect newly visible users. Anyone who used Bedrock without the OTEL sidecar had no counters at all and will appear for the first time — possibly already above a limit. Set `MonthlyEnforcementMode=alert` for the first enforced cycles so nobody is blocked by a restated total, and warn affected users.
+4. Switch to `QuotaWriteMode=enforce` and re-enable blocking.
+
+To verify idempotency after cutover, invoke the Lambda twice and confirm
+`estimated_cost` is **unchanged**. Under the old `ADD` behavior it would have doubled.
 
 
 ## Token-Based Limits (Legacy)
@@ -468,10 +553,42 @@ aws dynamodb scan --table-name QuotaPolicies \
 
 ### Common Issues
 
-- **No alerts**: Verify SNS subscriptions are confirmed and EventBridge rule is enabled
+- **No alerts**: Verify SNS subscriptions are confirmed and EventBridge rule is enabled. A topic with zero subscriptions swallows every alert silently — `publish` succeeds, nobody is notified. Check with `aws sns list-subscriptions-by-topic`.
+- **Alerts stop after the first one per user**: expected. Alerts are deduplicated per month by `{email}#{alert_type}#{level}`, recorded under `pk=ALERTS`. A user already alerted at `warning` will not re-alert at `warning` again this month, but will still alert when they cross `critical` and `exceeded`.
 - **Missing users**: Check JWT tokens include email claim
 - **Wrong policy applied**: Verify group claims are present in JWT tokens
 - **Groups not detected**: Check that `ENABLE_FINEGRAINED_QUOTAS` is set to `true`
+- **Reading the `Summary` log line**: it is tagged with the dimension it measured — `Summary (cost)` counts users against their `MonthlyCostLimitUsd` budget, `Summary (tokens)` against `MonthlyTokenLimit`. A `$` budget takes precedence when both are set, since that is the limit `quota_check` enforces. `Summary (no limits set)` means both limits are 0 and nothing is being enforced at all.
+
+### Database connectivity
+
+The monitor returns HTTP 500 and logs an error whenever it cannot read usage. Look
+for these in the Lambda logs:
+
+- **`TELEMETRY_DB_SECRET_ARN is not configured`** — the stack was deployed without a telemetry database. Set it via `ccwb init` and redeploy.
+- **Connection timeouts** — the Lambda cannot reach the database. Check that `TelemetryDbSubnetIds` are in a VPC with a route to it, that the database's security group allows the monitor's security group (or its subnet CIDRs) on the DB port, and that `TelemetryDbHost` still resolves. An autoscaling-managed instance can change its primary private IP; prefer a DNS name or a stable secondary IP.
+- **SSL errors** — the server may have `ssl = off`. Confirm with `SHOW ssl;` and set `TelemetryDbSslMode=disable` if so, or supply `TelemetryDbCaPem` for `verify-full`.
+- **Timeouts on DynamoDB/SNS/Secrets Manager rather than the database** — once the function is attached to a VPC, those calls need NAT egress or VPC endpoints. A missing route here looks like an unrelated failure.
+- **`Refusing to write` with an operational alert** — the safety floor tripped: the query returned far fewer identities than DynamoDB already has. Run the query manually before overriding `QuotaDbMinRowRatio`; a genuinely truncated result written as absolute values would zero out real accounting.
+
+To run the monitor's query by hand, tunnel to the database and query the same view
+the Lambda reads:
+
+```bash
+aws ssm start-session --region us-east-1 --target <instance-id> \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["<db-host>"],"portNumber":["5432"],"localPortNumber":["15432"]}'
+```
+
+```sql
+SELECT count(*) AS identities, round(sum(cost_usd)::numeric, 2) AS mtd_cost
+  FROM telemetry.unified_hourly_cost
+ WHERE time >= date_trunc('month', now());
+```
+
+If that returns plausible numbers but DynamoDB does not change, check
+`QUOTA_WRITE_MODE` — in `shadow` mode the monitor logs differences without writing
+counters.
 
 For detailed monitoring setup, see the [Monitoring Guide](MONITORING.md).
 
@@ -483,13 +600,21 @@ For detailed monitoring setup, see the [Monitoring Guide](MONITORING.md).
 - SNS: $0.50 per million notifications
 - CloudWatch Logs: Standard retention pricing
 - QuotaPolicies table: Minimal cost (policies rarely change)
+- NAT gateway data processing, if the function runs in a VPC without VPC endpoints (the queries themselves are small, but all DynamoDB/SNS/Secrets Manager traffic now traverses NAT)
+
+The CloudWatch Prometheus-compatible API queries the old design made are no longer
+performed, so that cost goes away.
 
 ## Data Schema
 
 ### UserQuotaMetrics Table
 
 **User Totals**: `PK: USER#{email}`, `SK: MONTH#{YYYY-MM}`
-- Attributes: `total_tokens`, `daily_tokens`, `daily_date`, `input_tokens`, `output_tokens`, `cache_tokens`, `groups`, `last_updated`, `email`
+- Attributes: `total_tokens`, `daily_tokens`, `daily_date`, `input_tokens`, `output_tokens`, `cache_tokens`, `estimated_cost`, `daily_cost_usd`, `cost_source`, `groups`, `last_updated`, `email`
+- All usage attributes are **absolute month-to-date totals** restated on every run, not running sums. `daily_tokens`/`daily_cost_usd` apply to `daily_date`; consumers treat them as 0 when `daily_date` is not today.
+- `cache_tokens` counts cache **reads** only. Cache-creation tokens are included in `total_tokens` and priced, but are not broken out separately.
+- `cost_source` records which relation the figures came from (e.g. `telemetry.unified_hourly_cost`), so a stale item written by an older version is identifiable.
+- `estimated_cost` and `daily_cost_usd` are DynamoDB **Numbers**, not strings.
 - TTL: End of following month
 
 **Alert History**: `PK: ALERTS`, `SK: {YYYY-MM}#ALERT#{email}#{type}#{level}[#{date}]`

@@ -1,20 +1,31 @@
-# ABOUTME: Tests for the quota_monitor Lambda's stale-day guard on the daily counter
-# ABOUTME: Idle users whose daily_date is not today must not re-alert as "daily exceeded"
+# ABOUTME: Tests for the quota_monitor Lambda's TimescaleDB cost source and absolute writes
+# ABOUTME: Covers the stale-day guard, idempotent SET writes, shadow mode and the safety floor
 
-"""Tests for quota_monitor daily stale-day reset in the threshold/alert step.
+"""Tests for quota_monitor.
 
-Regression: an idle user's daily_tokens froze above the daily limit and a fresh
-"Daily Token Quota EXCEEDED" alert went out every new UTC day, because the
-threshold step read daily_tokens verbatim (without the stale-day guard that
-quota_check already applies).
+Two regressions are pinned here:
+
+1. Stale-day guard: an idle user's daily_tokens froze above the daily limit and a
+   fresh "Daily Token Quota EXCEEDED" alert went out every new UTC day, because
+   the threshold step read daily_tokens verbatim (without the guard that
+   quota_check already applies). This still matters for users present in
+   DynamoDB but absent from the telemetry DB result.
+
+2. Absolute writes: cost used to be accumulated with a DynamoDB `ADD` over a
+   rolling 15-minute PromQL delta, which had no watermark and no dedup key — a
+   retried or missed invocation permanently skewed the counter. The monitor now
+   reads month-to-date totals from TimescaleDB and writes them with `SET`, which
+   is idempotent and self-healing.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -28,6 +39,8 @@ LAMBDA_PATH = (
     / "quota_monitor"
     / "index.py"
 )
+
+SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:telemetry-db-AbCdEf"
 
 
 def _load_quota_monitor(env: dict) -> object:
@@ -46,13 +59,25 @@ def _load_quota_monitor(env: dict) -> object:
 
 @pytest.fixture
 def base_env():
+    # QUOTA_WRITE_MODE is intentionally left at its "shadow" default here so the
+    # threshold tests exercise the DynamoDB-derived path.
     return {
         "QUOTA_TABLE": "TestQuotaTable",
         "POLICIES_TABLE": "TestPoliciesTable",
         "SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:123456789012:test-alerts",
         "ENABLE_FINEGRAINED_QUOTAS": "false",
         "MONTHLY_TOKEN_LIMIT": "40000000",
+        "TELEMETRY_DB_SECRET_ARN": SECRET_ARN,
+        "TELEMETRY_DB_HOST": "10.0.0.1",
+        "QUOTA_WRITE_MODE": "shadow",
     }
+
+
+@pytest.fixture
+def enforce_env(base_env):
+    env = dict(base_env)
+    env["QUOTA_WRITE_MODE"] = "enforce"
+    return env
 
 
 def _today() -> str:
@@ -68,14 +93,40 @@ def _scan_response(items: list[dict]) -> dict:
     return {"Items": items}
 
 
-def _patch_monitor(mod, scan_item: dict, daily_token_limit: int = 2_000_000):
-    """Wire the monitor so it skips PromQL/update and scans a single user row.
+def _usage(monthly_cost=0.0, daily_cost=0.0, total=0, daily=0, inp=0, out=0, cache=0):
+    return {
+        "total_tokens": total,
+        "daily_tokens": daily,
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cache_tokens": cache,
+        "monthly_cost": monthly_cost,
+        "daily_cost": daily_cost,
+    }
+
+
+def _fake_conn(rows):
+    """A DB-API stand-in for the telemetry DB, so tests never need a live server."""
+    cursor = MagicMock()
+    cursor.fetchall.return_value = rows
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    return conn, cursor
+
+
+def _patch_monitor(mod, scan_item: dict, daily_token_limit: int = 2_000_000, db_usage=None):
+    """Wire the monitor so the DB read is stubbed and the scan returns one user row.
+
+    The stubbed DB result deliberately describes a *different* identity than the
+    scanned row: that is the real-world case the stale-day guard protects (a user
+    with a DynamoDB row who no longer appears in the telemetry query), and it
+    keeps the safety floor satisfied.
 
     Returns the MagicMock SNS client for assertions on published alerts.
     """
-    # No new activity -> update step is a no-op and daily reset never happens
-    # via update_quota_metrics (this is the idle-user condition).
-    mod.fetch_usage_from_promql = MagicMock(return_value={})
+    if db_usage is None:
+        db_usage = {"someone.else@example.com": _usage(monthly_cost=1.0, total=100)}
+    mod.fetch_usage_from_db = MagicMock(return_value=db_usage)
 
     mod.quota_table = MagicMock()
     mod.quota_table.scan.return_value = _scan_response([scan_item])
@@ -106,6 +157,15 @@ def _daily_alert_published(sns_client) -> bool:
         if "Daily Token Quota" in subject:
             return True
     return False
+
+
+def _user_updates(quota_table):
+    """The update_item calls that targeted a USER# item, as kwargs dicts."""
+    return [
+        c.kwargs
+        for c in quota_table.update_item.call_args_list
+        if str(c.kwargs.get("Key", {}).get("pk", "")).startswith("USER#")
+    ]
 
 
 class TestStaleDailyReset:
@@ -168,127 +228,604 @@ class TestStaleDailyReset:
         assert entry["daily_tokens"] == 3_355_533
 
 
-class TestCostEstimateTokenTypes:
-    """Regression: cost must price all four token types, including cacheCreation.
+class TestPolicyPagination:
+    """Every scan page must produce the same policy shape.
 
-    The metric's `type` dimension is camelCase (input/output/cacheRead/
-    cacheCreation) but the rate tables use snake_case keys (input/output/
-    cache_read/cache_write). The old code only rewrote cacheRead->cache_read, so
-    cacheCreation looked up a non-existent key and priced at $0 — dropping the
-    cache-write share of the cost, which is usually the majority of tokens.
+    The pagination branch used to rebuild the policy dict itself and had dropped
+    `monthly_cost_limit`/`daily_cost_limit`, so a policy landing on page 2+ came
+    back with a $0 budget and went unenforced -- for some users and not others,
+    depending on scan ordering. Once there are enough policies to paginate, that
+    is invisible without a test like this.
     """
 
-    def _run_cost(self, mod, type_model_vector):
-        """Drive fetch_usage_from_promql with a canned type+model breakdown.
+    def _policy_item(self, policy_type, identifier, monthly_cost=None):
+        item = {
+            "pk": f"POLICY#{policy_type}#{identifier}", "sk": "CURRENT",
+            "policy_type": policy_type, "identifier": identifier,
+            "monthly_token_limit": 0, "daily_token_limit": 0,
+            "warning_threshold_80": 0, "warning_threshold_90": 0,
+            "enforcement_mode": "alert", "enabled": True,
+        }
+        if monthly_cost is not None:
+            item["monthly_cost_limit"] = Decimal(str(monthly_cost))
+        return item
 
-        Only the (user.email, type, model) query returns data; the primary
-        total, type-only, and CoWork queries return empty so we isolate the
-        cost calculation. Returns the users dict.
-        """
+    def _paged(self, mod, pages):
+        mod.policies_table = MagicMock()
+        mod.policies_table.scan.side_effect = pages
+        return mod.load_all_policies()
 
-        def fake_query(query, time_param=None):
-            if ", type, model)" in query and "claude_code.token.usage" in query:
-                return type_model_vector
-            return []
-
-        mod._promql_query = fake_query
-        return mod.fetch_usage_from_promql()
-
-    def test_cache_creation_is_priced(self, base_env):
-        """A cacheCreation-only breakdown must produce a non-zero cost."""
+    def test_cost_limits_survive_a_paginated_scan(self, base_env):
         mod = _load_quota_monitor(base_env)
-        # opus cache_write rate = 6.25 / 1M tokens; 1,000,000 tokens -> $6.25
-        vector = [
-            {
-                "metric": {"user.email": "a@b.com", "type": "cacheCreation", "model": "claude-opus-4-8"},
-                "value": [0, "1000000"],
-            }
-        ]
-        users = self._run_cost(mod, vector)
-        assert users["a@b.com"]["cost_usd"] == pytest.approx(6.25)
+        policies = self._paged(mod, [
+            {"Items": [self._policy_item("default", "default", 1000)],
+             "LastEvaluatedKey": {"pk": "POLICY#default#default", "sk": "CURRENT"}},
+            {"Items": [self._policy_item("user", "big.spender@example.com", 2500)]},
+        ])
+        assert policies["default:default"]["monthly_cost_limit"] == 1000.0
+        # The page-2 policy is the one the old code silently zeroed.
+        assert policies["user:big.spender@example.com"]["monthly_cost_limit"] == 2500.0
 
-    def test_all_four_types_priced(self, base_env):
-        """input/output/cacheRead/cacheCreation each contribute to the cost."""
+    def test_every_page_uses_the_same_policy_shape(self, base_env):
         mod = _load_quota_monitor(base_env)
-        # opus rates per 1M: input 5.00, output 25.00, cache_read 0.50, cache_write 6.25
-        vector = [
-            {"metric": {"user.email": "a@b.com", "type": "input", "model": "claude-opus-4-8"}, "value": [0, "1000000"]},
-            {
-                "metric": {"user.email": "a@b.com", "type": "output", "model": "claude-opus-4-8"},
-                "value": [0, "1000000"],
-            },
-            {
-                "metric": {"user.email": "a@b.com", "type": "cacheRead", "model": "claude-opus-4-8"},
-                "value": [0, "1000000"],
-            },
-            {
-                "metric": {"user.email": "a@b.com", "type": "cacheCreation", "model": "claude-opus-4-8"},
-                "value": [0, "1000000"],
-            },
-        ]
-        users = self._run_cost(mod, vector)
-        assert users["a@b.com"]["cost_usd"] == pytest.approx(5.00 + 25.00 + 0.50 + 6.25)
+        policies = self._paged(mod, [
+            {"Items": [self._policy_item("default", "default", 1000)],
+             "LastEvaluatedKey": {"pk": "POLICY#default#default", "sk": "CURRENT"}},
+            {"Items": [self._policy_item("user", "second.page@example.com", 50)]},
+        ])
+        assert set(policies["default:default"]) == set(policies["user:second.page@example.com"])
+
+    def test_pagination_carries_the_filter_and_the_start_key(self, base_env):
+        mod = _load_quota_monitor(base_env)
+        self._paged(mod, [
+            {"Items": [], "LastEvaluatedKey": {"pk": "POLICY#a#b", "sk": "CURRENT"}},
+            {"Items": []},
+        ])
+        first, second = mod.policies_table.scan.call_args_list
+        assert "FilterExpression" in first.kwargs
+        assert "ExclusiveStartKey" not in first.kwargs
+        # Dropping the filter on later pages would pull in non-CURRENT revisions.
+        assert "FilterExpression" in second.kwargs
+        assert second.kwargs["ExclusiveStartKey"] == {"pk": "POLICY#a#b", "sk": "CURRENT"}
+
+    def test_stops_when_no_start_key_is_returned(self, base_env):
+        """side_effect raises StopIteration if the loop scans a third time."""
+        mod = _load_quota_monitor(base_env)
+        policies = self._paged(mod, [
+            {"Items": [self._policy_item("default", "default", 1000)],
+             "LastEvaluatedKey": {"pk": "POLICY#default#default", "sk": "CURRENT"}},
+            {"Items": [self._policy_item("user", "last@example.com", 10)]},
+        ])
+        assert mod.policies_table.scan.call_count == 2
+        assert len(policies) == 2
+
+    def test_missing_cost_limit_is_zero_not_an_error(self, base_env):
+        """Cost limits are written by a separate update_item, so they can be absent."""
+        mod = _load_quota_monitor(base_env)
+        policies = self._paged(mod, [{"Items": [self._policy_item("default", "default")]}])
+        assert policies["default:default"]["monthly_cost_limit"] == 0.0
+        assert policies["default:default"]["daily_cost_limit"] == 0.0
 
 
-class TestPromQLAggregationFunction:
-    """Regression: token.usage is a Counter exported with DELTA temporality.
+class TestSummaryCounters:
+    """The Summary log line must measure the limit that is actually enforced.
 
-    increase() assumes cumulative temporality and misreads the delta sawtooth's
-    down-steps as counter resets, returning empty/understated results. That froze
-    the DynamoDB row and surfaced as "Daily Tokens: 0" in `ccwb quota usage` while
-    Athena/CloudWatch (which sum the deltas) stayed correct. Aggregation MUST use
-    sum_over_time(). The existing tests mock fetch_usage_from_promql out entirely,
-    so the query construction — where the bug lived — was never exercised.
+    In cost mode the token limits are 0 (disabled), so counting token percentages
+    printed `Over 80%: 0, Over 90%: 0, Exceeded: 0` even with users thousands of
+    dollars over their $1,000 budget. An operator reads that line as "nobody is
+    near their limit", so a silently token-denominated summary is a real
+    observability bug, not a cosmetic one.
     """
 
-    def _capture_queries(self, mod, primary_total="531643"):
-        """Monkeypatch _promql_query to record every query string it receives.
+    COST_POLICY = {
+        "policy_type": "default",
+        "identifier": "environment",
+        # Cost mode: token limits and their thresholds are all disabled.
+        "monthly_token_limit": 0,
+        "daily_token_limit": None,
+        "warning_threshold_80": 0,
+        "warning_threshold_90": 0,
+        "monthly_cost_limit": 1000.0,
+        "daily_cost_limit": 0.0,
+        "enforcement_mode": "alert",
+        "enabled": True,
+    }
 
-        Returns the list that accumulates the queries. Only the primary
-        per-user total query gets a non-empty vector so the aggregation has
-        something to fold in; the rest return empty so cost/CoWork paths no-op.
+    def _run(self, mod, items, policy=None):
+        mod.fetch_usage_from_db = MagicMock(return_value={})
+        mod.quota_table = MagicMock()
+        mod.quota_table.scan.return_value = _scan_response(items)
+        mod.quota_table.query.return_value = {"Items": []}
+        mod.resolve_user_quota = MagicMock(return_value=policy or self.COST_POLICY)
+        mod.sns_client = MagicMock()
+        result = mod.lambda_handler({}, None)
+        return json.loads(result["body"])
+
+    def _item(self, email, cost):
+        return {"email": email, "estimated_cost": cost, "total_tokens": 1_000_000,
+                "daily_tokens": 0, "daily_date": _today()}
+
+    def test_counts_the_cost_ladder_not_tokens(self, base_env):
+        mod = _load_quota_monitor(base_env)
+        stats = self._run(mod, [
+            self._item("under@example.com", 100.00),      # 10%
+            self._item("warn@example.com", 850.00),        # 85%
+            self._item("critical@example.com", 950.00),    # 95%
+            self._item("over@example.com", 3405.83),       # 340%
+            self._item("also.over@example.com", 1449.22),  # 145%
+        ])
+        assert stats["limit_basis"] == "cost"
+        assert stats["total_users"] == 5
+        assert stats["over_80"] == 1
+        assert stats["over_90"] == 1
+        assert stats["exceeded"] == 2
+
+    def test_reports_mtd_spend_total(self, base_env):
+        mod = _load_quota_monitor(base_env)
+        stats = self._run(mod, [
+            self._item("a@example.com", 100.50),
+            self._item("b@example.com", 200.25),
+        ])
+        assert stats["monthly_cost_total"] == 300.75
+
+    def test_falls_back_to_tokens_when_no_cost_budget(self, base_env):
+        """Token-mode stacks must keep their original behaviour."""
+        mod = _load_quota_monitor(base_env)
+        policy = dict(self.COST_POLICY)
+        policy["monthly_cost_limit"] = 0.0
+        policy["monthly_token_limit"] = 40_000_000
+        item = self._item("heavy@example.com", 0.0)
+        item["total_tokens"] = 41_000_000  # over the token limit
+        stats = self._run(mod, [item], policy=policy)
+        assert stats["limit_basis"] == "tokens"
+        assert stats["exceeded"] == 1
+
+    def test_cost_budget_wins_when_both_limits_are_set(self, base_env):
+        """A user inside their token limit but over budget must still be counted."""
+        mod = _load_quota_monitor(base_env)
+        policy = dict(self.COST_POLICY)
+        policy["monthly_token_limit"] = 40_000_000
+        item = self._item("spendy@example.com", 1200.00)
+        item["total_tokens"] = 1_000_000  # well under the token limit
+        stats = self._run(mod, [item], policy=policy)
+        assert stats["limit_basis"] == "cost"
+        assert stats["exceeded"] == 1
+
+    def test_daily_exceeded_uses_the_daily_cost_budget(self, base_env):
+        mod = _load_quota_monitor(base_env)
+        policy = dict(self.COST_POLICY)
+        policy["daily_cost_limit"] = 50.0
+        item = self._item("burst@example.com", 200.00)
+        item["daily_cost_usd"] = 75.00
+        stats = self._run(mod, [item], policy=policy)
+        assert stats["daily_exceeded"] == 1
+
+
+class TestUsageSql:
+    """The SQL is the contract with the telemetry database."""
+
+    def test_targets_the_deduplicated_unified_view(self, base_env):
+        mod = _load_quota_monitor(base_env)
+        assert "telemetry.unified_hourly_cost" in mod.USAGE_SQL
+        assert mod.COST_SOURCE == "telemetry.unified_hourly_cost"
+
+    def test_scopes_to_month_and_day(self, base_env):
+        mod = _load_quota_monitor(base_env)
+        assert "date_trunc('month', now())" in mod.USAGE_SQL
+        assert "date_trunc('day', now())" in mod.USAGE_SQL
+
+    def test_groups_on_lowered_identity_but_selects_display_casing(self, base_env):
+        """Aggregate case-insensitively; key DynamoDB on the original spelling."""
+        mod = _load_quota_monitor(base_env)
+        assert "lower(user_email)" in mod.USAGE_SQL
+        assert "min(user_email)" in mod.USAGE_SQL
+
+    def test_counts_both_cache_read_spellings(self, base_env):
+        """The view unions a snake_case and a camelCase producer."""
+        mod = _load_quota_monitor(base_env)
+        assert "'cache_read'" in mod.USAGE_SQL
+        assert "'cacheRead'" in mod.USAGE_SQL
+
+    def test_filters_to_email_identities(self, base_env):
+        """Pin the server-side half of the email-only rule.
+
+        Dropping this from the SQL would still be caught by the client guard,
+        but only after transferring every service principal's row.
         """
-        captured = []
-
-        def fake_query(query, time_param=None):
-            captured.append(query)
-            is_primary = 'sum by ("user.email")' in query and ", type" not in query and ", model" not in query
-            if is_primary and "claude_code.token.usage" in query:
-                return [{"metric": {"user.email": "a@b.com"}, "value": [0, primary_total]}]
-            return []
-
-        mod._promql_query = fake_query
-        return captured
-
-    def test_claude_code_queries_use_sum_over_time_not_increase(self, base_env):
         mod = _load_quota_monitor(base_env)
-        captured = self._capture_queries(mod)
+        assert "user_email LIKE '%@%'" in mod.USAGE_SQL
 
-        mod.fetch_usage_from_promql()
-
-        cc_queries = [q for q in captured if "claude_code.token.usage" in q]
-        assert cc_queries, "expected at least one claude_code.token.usage query"
-        for q in cc_queries:
-            assert "sum_over_time(" in q, f"delta metric must use sum_over_time: {q}"
-            assert "increase(" not in q, f"increase() is wrong for a delta metric: {q}"
-
-    def test_cowork_queries_use_sum_over_time_not_increase(self, base_env):
+    def test_is_a_static_select_with_no_interpolation(self, base_env):
         mod = _load_quota_monitor(base_env)
-        captured = self._capture_queries(mod)
+        assert mod.USAGE_SQL.strip().startswith("SELECT")
+        assert "%s" not in mod.USAGE_SQL
+        assert "{" not in mod.USAGE_SQL
 
-        mod.fetch_usage_from_promql()
 
-        cowork_queries = [q for q in captured if "ClaudeCoWork" in q]
-        assert cowork_queries, "expected CoWork token.usage queries"
-        for q in cowork_queries:
-            assert "sum_over_time(" in q, f"CoWork delta metric must use sum_over_time: {q}"
-            assert "increase(" not in q, f"increase() is wrong for a delta metric: {q}"
+class TestFetchUsageFromDb:
+    def _rows(self):
+        # (email_key, email_display, monthly_cost, daily_cost,
+        #  total_tokens, daily_tokens, input_tokens, output_tokens, cache_tokens)
+        return [
+            (
+                "alice.smith@example.com",
+                "Alice.Smith@example.com",
+                Decimal("123.456789"),
+                Decimal("12.5"),
+                1_000_000,
+                50_000,
+                400_000,
+                100_000,
+                500_000,
+            ),
+            ("cdp-ci-role", "cdp-ci-role", Decimal("23.95"), Decimal("0"), 9_000, 0, 3_000, 1_000, 5_000),
+        ]
 
-    def test_aggregated_total_flows_through(self, base_env):
-        """A non-empty primary vector must be recorded (not skipped as delta<=0)."""
+    def test_preserves_original_case_for_the_dynamodb_key(self, base_env):
+        """Verified against production: the DB's casing matches the existing pk."""
         mod = _load_quota_monitor(base_env)
-        self._capture_queries(mod, primary_total="531643")
+        conn, _ = _fake_conn(self._rows())
+        usage = mod.fetch_usage_from_db(conn_factory=lambda: conn)
+        assert "Alice.Smith@example.com" in usage
+        assert "alice.smith@example.com" not in usage
 
-        users = mod.fetch_usage_from_promql()
+    def test_maps_all_counters(self, base_env):
+        mod = _load_quota_monitor(base_env)
+        conn, _ = _fake_conn(self._rows())
+        usage = mod.fetch_usage_from_db(conn_factory=lambda: conn)
+        u = usage["Alice.Smith@example.com"]
+        assert u["monthly_cost"] == pytest.approx(123.456789)
+        assert u["daily_cost"] == pytest.approx(12.5)
+        assert u["total_tokens"] == 1_000_000
+        assert u["daily_tokens"] == 50_000
+        assert u["input_tokens"] == 400_000
+        assert u["output_tokens"] == 100_000
+        assert u["cache_tokens"] == 500_000
 
-        assert users.get("a@b.com", {}).get("total_tokens") == 531643
+    def test_excludes_non_email_service_identities(self, base_env):
+        """Only humans get quota rows; service/CI roles have nobody to notify.
+
+        USAGE_SQL filters these server-side, so a fake cursor that *returns* one
+        is exactly the case the client-side guard exists for -- this test fails
+        if that guard is dropped on the assumption the SQL is enough.
+        """
+        mod = _load_quota_monitor(base_env)
+        conn, _ = _fake_conn(self._rows())
+        usage = mod.fetch_usage_from_db(conn_factory=lambda: conn)
+        assert "cdp-ci-role" not in usage
+        assert list(usage) == ["Alice.Smith@example.com"]
+
+    def test_closes_the_connection(self, base_env):
+        mod = _load_quota_monitor(base_env)
+        conn, cursor = _fake_conn(self._rows())
+        mod.fetch_usage_from_db(conn_factory=lambda: conn)
+        conn.close.assert_called_once()
+        cursor.close.assert_called_once()
+
+    def test_skips_blank_and_overlong_identities(self, base_env):
+        mod = _load_quota_monitor(base_env)
+        rows = [
+            ("", "   ", Decimal("1"), Decimal("0"), 1, 0, 0, 0, 0),
+            ("x" * 400, "x" * 400, Decimal("1"), Decimal("0"), 1, 0, 0, 0, 0),
+        ]
+        conn, _ = _fake_conn(rows)
+        assert mod.fetch_usage_from_db(conn_factory=lambda: conn) == {}
+
+
+class TestAbsoluteWrites:
+    def _run(self, mod, usage=None):
+        mod.quota_table = MagicMock()
+        usage = usage or {
+            "a@b.com": _usage(monthly_cost=42.123456789, daily_cost=1.5, total=999, daily=10, inp=5, out=4, cache=990)
+        }
+        mod.write_usage_absolute(usage, shadow=False)
+        return _user_updates(mod.quota_table)[0]
+
+    def test_uses_set_and_never_add(self, enforce_env):
+        """The whole point of the migration: no accumulator."""
+        mod = _load_quota_monitor(enforce_env)
+        kwargs = self._run(mod)
+        expr = kwargs["UpdateExpression"]
+        assert expr.startswith("SET ")
+        assert "ADD" not in expr
+
+    def test_writes_every_counter_and_the_consumer_contract_fields(self, enforce_env):
+        mod = _load_quota_monitor(enforce_env)
+        kwargs = self._run(mod)
+        expr = kwargs["UpdateExpression"]
+        for attr in (
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cache_tokens",
+            "estimated_cost",
+            "daily_tokens",
+            "daily_cost_usd",
+            "daily_date",
+            "last_updated",
+            "email",
+            "cost_source",
+        ):
+            assert attr in expr, f"{attr} must be written"
+        assert kwargs["ExpressionAttributeNames"] == {"#ttl": "ttl"}
+
+    def test_estimated_cost_is_a_number_not_a_string(self, enforce_env):
+        """quota_check does float(...) on this; a String would break comparisons."""
+        mod = _load_quota_monitor(enforce_env)
+        kwargs = self._run(mod)
+        assert isinstance(kwargs["ExpressionAttributeValues"][":cost"], Decimal)
+        assert kwargs["ExpressionAttributeValues"][":cost"] == Decimal("42.123457")
+
+    def test_last_updated_is_z_suffixed(self, enforce_env):
+        """sidecar_monitor parses this with .replace("Z", "+00:00")."""
+        mod = _load_quota_monitor(enforce_env)
+        kwargs = self._run(mod)
+        assert kwargs["ExpressionAttributeValues"][":ts"].endswith("Z")
+
+    def test_email_attribute_is_written(self, enforce_env):
+        """The threshold pass joins on the top-level email attribute, not the key."""
+        mod = _load_quota_monitor(enforce_env)
+        kwargs = self._run(mod)
+        assert kwargs["ExpressionAttributeValues"][":email"] == "a@b.com"
+        assert kwargs["Key"]["pk"] == "USER#a@b.com"
+
+    def test_daily_date_is_stamped_to_today(self, enforce_env):
+        mod = _load_quota_monitor(enforce_env)
+        kwargs = self._run(mod)
+        assert kwargs["ExpressionAttributeValues"][":date"] == _today()
+
+    def test_no_read_before_write(self, enforce_env):
+        """Absolute writes need no prior daily_date, so the per-user GetItem is gone."""
+        mod = _load_quota_monitor(enforce_env)
+        mod.quota_table = MagicMock()
+        mod.write_usage_absolute({"a@b.com": _usage(total=1)}, shadow=False)
+        mod.quota_table.get_item.assert_not_called()
+
+    def test_zero_usage_user_is_still_written(self, enforce_env):
+        """Zero is a legitimate absolute value; skipping it stranded daily_date."""
+        mod = _load_quota_monitor(enforce_env)
+        mod.quota_table = MagicMock()
+        mod.write_usage_absolute({"a@b.com": _usage()}, shadow=False)
+        assert len(_user_updates(mod.quota_table)) == 1
+
+
+class TestIdempotence:
+    def test_two_identical_runs_produce_identical_writes(self, enforce_env):
+        """Under the old ADD this doubled the counters; now it is a no-op."""
+        mod = _load_quota_monitor(enforce_env)
+        usage = {"a@b.com": _usage(monthly_cost=10.0, total=500)}
+
+        mod.quota_table = MagicMock()
+        mod.write_usage_absolute(usage, shadow=False)
+        first = _user_updates(mod.quota_table)[0]
+
+        mod.quota_table = MagicMock()
+        mod.write_usage_absolute(usage, shadow=False)
+        second = _user_updates(mod.quota_table)[0]
+
+        assert first["UpdateExpression"] == second["UpdateExpression"]
+        assert first["ExpressionAttributeValues"][":tt"] == second["ExpressionAttributeValues"][":tt"]
+        assert first["ExpressionAttributeValues"][":cost"] == second["ExpressionAttributeValues"][":cost"]
+
+
+class TestMonthEndTtl:
+    """The usage row must expire one month on, at a stable instant.
+
+    Two defects are pinned here. Both were silent: nothing reads an expired row
+    (October writes land on a different sort key), so the only symptom was rows
+    lingering in the table longer than intended.
+
+    1. Month skip: `now.replace(day=28) + timedelta(days=32)` overshoots into the
+       month *after* next for January in non-leap years (Jan 28 + 32d = Mar 1),
+       doubling the lifetime of every January row.
+    2. Drifting expiry: the time fields were inherited from the Lambda's run
+       time, so a row rewritten every 15 minutes carried a different ttl on each
+       write.
+    """
+
+    @pytest.mark.parametrize("year", [2027, 2028])  # non-leap, leap
+    @pytest.mark.parametrize("month", range(1, 13))
+    def test_advances_exactly_one_month(self, base_env, year, month):
+        mod = _load_quota_monitor(base_env)
+        ttl = mod._month_end_ttl(datetime(year, month, 15, 12, 34, 56, tzinfo=timezone.utc))
+        landed = datetime.fromtimestamp(ttl, tz=timezone.utc)
+
+        expected_month = 1 if month == 12 else month + 1
+        expected_year = year + 1 if month == 12 else year
+        assert (landed.year, landed.month, landed.day) == (expected_year, expected_month, 1)
+        assert (landed.hour, landed.minute, landed.second) == (0, 0, 0)
+
+    def test_january_non_leap_does_not_skip_february(self, base_env):
+        """Regression: the day=28 idiom returned Mar 1 here, not Feb 1."""
+        mod = _load_quota_monitor(base_env)
+        ttl = mod._month_end_ttl(datetime(2027, 1, 15, tzinfo=timezone.utc))
+
+        assert ttl == int(datetime(2027, 2, 1, tzinfo=timezone.utc).timestamp())
+
+    def test_expiry_is_stable_across_run_times(self, base_env):
+        """Same month, different invocation times -> identical ttl."""
+        mod = _load_quota_monitor(base_env)
+        ttls = {
+            mod._month_end_ttl(datetime(2026, 9, day, hour, minute, tzinfo=timezone.utc))
+            for day, hour, minute in ((1, 0, 0), (10, 20, 34), (30, 23, 59))
+        }
+
+        assert ttls == {int(datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp())}
+
+    def test_is_epoch_seconds(self, base_env):
+        """Milliseconds would park the expiry ~50,000 years out and never fire."""
+        mod = _load_quota_monitor(base_env)
+        ttl = mod._month_end_ttl(datetime(2026, 9, 10, tzinfo=timezone.utc))
+
+        assert isinstance(ttl, int)
+        assert 1_000_000_000 < ttl < 4_000_000_000
+
+    def test_written_row_carries_the_computed_ttl(self, enforce_env):
+        """The value reaching DynamoDB is the helper's, not a separate calculation."""
+        mod = _load_quota_monitor(enforce_env)
+        mod.quota_table = MagicMock()
+        mod.write_usage_absolute({"a@b.com": _usage(monthly_cost=10.0, total=500)}, shadow=False)
+
+        kwargs = _user_updates(mod.quota_table)[0]
+        written = kwargs["ExpressionAttributeValues"][":ttl"]
+        expected = mod._month_end_ttl(datetime.now(timezone.utc))
+
+        assert written == expected
+        landed = datetime.fromtimestamp(written, tz=timezone.utc)
+        assert (landed.day, landed.hour, landed.minute, landed.second) == (1, 0, 0, 0)
+
+
+class TestShadowMode:
+    def test_shadow_writes_only_liveness_attributes(self, base_env):
+        """Counters stay frozen, but last_updated keeps bypass detection working."""
+        mod = _load_quota_monitor(base_env)
+        mod.quota_table = MagicMock()
+        mod.write_usage_absolute({"a@b.com": _usage(monthly_cost=99.0, total=1)}, shadow=True)
+        kwargs = _user_updates(mod.quota_table)[0]
+        expr = kwargs["UpdateExpression"]
+        assert "last_updated" in expr
+        assert "email" in expr
+        for frozen in ("total_tokens", "estimated_cost", "daily_cost_usd", "cost_source"):
+            assert frozen not in expr, f"{frozen} must not be written in shadow mode"
+
+    def test_handler_defaults_to_shadow(self, base_env):
+        env = dict(base_env)
+        env.pop("QUOTA_WRITE_MODE", None)
+        os.environ.pop("QUOTA_WRITE_MODE", None)
+        mod = _load_quota_monitor(env)
+        assert mod.QUOTA_WRITE_MODE == "shadow"
+
+    def test_shadow_reports_mode_in_response(self, base_env):
+        mod = _load_quota_monitor(base_env)
+        _patch_monitor(mod, scan_item={"email": "a@b.com", "total_tokens": 1, "daily_date": _today()})
+        result = mod.lambda_handler({}, None)
+        assert '"write_mode": "shadow"' in result["body"]
+
+
+class TestSafetyFloor:
+    """With absolute SET, a bad query would zero out real accounting."""
+
+    def test_empty_result_is_refused(self, enforce_env):
+        mod = _load_quota_monitor(enforce_env)
+        assert mod._write_is_safe(0, 316) is False
+
+    def test_truncated_result_is_refused(self, enforce_env):
+        mod = _load_quota_monitor(enforce_env)
+        assert mod._write_is_safe(10, 316) is False
+
+    def test_plausible_result_is_allowed(self, enforce_env):
+        mod = _load_quota_monitor(enforce_env)
+        assert mod._write_is_safe(413, 316) is True
+
+    def test_first_ever_run_is_allowed(self, enforce_env):
+        """No existing rows means no baseline to compare against."""
+        mod = _load_quota_monitor(enforce_env)
+        assert mod._write_is_safe(413, 0) is True
+
+    def test_handler_does_not_write_when_floor_trips(self, enforce_env):
+        mod = _load_quota_monitor(enforce_env)
+        sns = _patch_monitor(
+            mod,
+            scan_item={"email": "a@b.com", "total_tokens": 5_000_000, "daily_date": _today()},
+            db_usage={},  # zero identities -> floor trips
+        )
+        result = mod.lambda_handler({}, None)
+        assert result["statusCode"] == 500
+        assert _user_updates(mod.quota_table) == []
+        assert sns.publish.called, "operators must be told the write was refused"
+
+    def test_db_failure_aborts_writes_but_still_checks_thresholds(self, enforce_env):
+        """The cost source is no longer optional, but alerting must not stop."""
+        mod = _load_quota_monitor(enforce_env)
+        _patch_monitor(
+            mod,
+            scan_item={
+                "email": "a@b.com",
+                "total_tokens": 3_355_533,
+                "daily_tokens": 3_355_533,
+                "daily_date": _today(),
+            },
+        )
+        mod.fetch_usage_from_db = MagicMock(side_effect=RuntimeError("connection refused"))
+
+        result = mod.lambda_handler({}, None)
+        assert result["statusCode"] == 500
+        assert _user_updates(mod.quota_table) == []
+        assert '"total_users": 1' in result["body"], "thresholds must still be evaluated"
+
+    def test_missing_db_config_is_an_error_not_a_silent_skip(self, base_env):
+        env = dict(base_env)
+        env["TELEMETRY_DB_SECRET_ARN"] = ""
+        mod = _load_quota_monitor(env)
+        _patch_monitor(mod, scan_item={"email": "a@b.com", "total_tokens": 1, "daily_date": _today()})
+        result = mod.lambda_handler({}, None)
+        assert result["statusCode"] == 500
+
+
+class TestEnforceModeMerge:
+    def test_fresh_db_values_drive_alerts(self, enforce_env):
+        """Alerting on same-run values removes the old read-after-write race."""
+        mod = _load_quota_monitor(enforce_env)
+        sns = _patch_monitor(
+            mod,
+            scan_item={
+                "email": "a@b.com",
+                "total_tokens": 100,  # stale DynamoDB value
+                "daily_tokens": 0,
+                "daily_date": _today(),
+            },
+            db_usage={"a@b.com": _usage(total=5_000_000, daily=3_000_000, monthly_cost=50.0)},
+        )
+        result = mod.lambda_handler({}, None)
+        assert result["statusCode"] == 200
+        # daily limit is 2,000,000 and the DB says 3,000,000 today
+        assert _daily_alert_published(sns), "must alert on the DB-derived daily value"
+
+
+class TestSslMode:
+    def test_disable_yields_no_ssl_context(self, base_env):
+        """The server currently has ssl=off, so plaintext is the working default."""
+        env = dict(base_env)
+        env["TELEMETRY_DB_SSL_MODE"] = "disable"
+        mod = _load_quota_monitor(env)
+        assert mod._ssl_context() is None
+
+    def test_require_builds_an_unverified_context(self, base_env):
+        env = dict(base_env)
+        env["TELEMETRY_DB_SSL_MODE"] = "require"
+        mod = _load_quota_monitor(env)
+        ctx = mod._ssl_context()
+        assert ctx is not None
+        assert ctx.check_hostname is False
+
+    def test_verify_full_requires_a_ca(self, base_env):
+        env = dict(base_env)
+        env["TELEMETRY_DB_SSL_MODE"] = "verify-full"
+        env["TELEMETRY_DB_CA_PEM"] = ""
+        mod = _load_quota_monitor(env)
+        with pytest.raises(RuntimeError, match="TELEMETRY_DB_CA_PEM"):
+            mod._ssl_context()
+
+
+class TestNoPromqlSurfaceRemains:
+    def test_promql_and_pricing_paths_are_gone(self, base_env):
+        """Cost is computed in the database now — there is exactly one formula."""
+        mod = _load_quota_monitor(base_env)
+        for gone in (
+            "_promql_query",
+            "fetch_usage_from_promql",
+            "update_quota_metrics",
+            "AGGREGATION_WINDOW",
+            "TOKEN_TYPE_TO_RATE_KEY",
+            "PROMQL_ENDPOINT",
+            "METRICS_REGION",
+        ):
+            assert not hasattr(mod, gone), f"{gone} should have been removed"
+
+    def test_driver_import_is_lazy(self, base_env):
+        """A module-scope pg8000 import would break every test in this file."""
+        source = LAMBDA_PATH.read_text()
+        module_level = [
+            line for line in source.splitlines() if line.startswith("import pg8000") or line.startswith("from pg8000")
+        ]
+        assert module_level == [], "pg8000 must be imported inside _db_connect"
