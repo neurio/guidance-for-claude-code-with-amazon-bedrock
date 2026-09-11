@@ -968,3 +968,163 @@ class TestAlertMessageAttributes:
         mod._publish_operational_alert("Safety floor tripped", "details")
         kwargs = mod.sns_client.publish.call_args.kwargs
         assert "MessageAttributes" not in kwargs
+
+
+class TestAlertDedupKey:
+    """Pin the dedup key against the pagination drift that re-alerted daily users.
+
+    `get_sent_alerts` built the key inline in two places: the first page tested
+    `atype.startswith("daily")` and the pagination loop tested `atype == "daily"`.
+    So a `daily_cost` row on the second page was keyed WITHOUT its date, never
+    matched the dated key `check_limits_and_generate_alerts` looks for, and the
+    user was re-alerted on every 15-minute run for the rest of the day.
+
+    This is not hypothetical at scale: the ALERTS query is a single 1MB page, so
+    it spills once daily budgets are enabled broadly (users x 3 levels x days).
+    """
+
+    ALERT_TYPES_WITH_DATE = ("daily", "daily_cost")
+    ALERT_TYPES_NO_DATE = ("monthly", "monthly_cost")
+
+    def _paged(self, mod, pages):
+        """Wire quota_table.query to return the given pages in order."""
+        responses = []
+        for i, items in enumerate(pages):
+            resp = {"Items": items}
+            if i < len(pages) - 1:
+                resp["LastEvaluatedKey"] = {"pk": "ALERTS", "sk": items[-1]["sk"]}
+            responses.append(resp)
+        mod.quota_table = MagicMock()
+        mod.quota_table.query.side_effect = responses
+
+    @staticmethod
+    def _sk(email, atype, level, date=None):
+        """Build a sort key exactly as record_sent_alert does: date LAST."""
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
+        tail = f"#{date}" if date else ""
+        return f"{month}#ALERT#{email}#{atype}#{level}{tail}"
+
+    @pytest.mark.parametrize("alert_type", ALERT_TYPES_WITH_DATE)
+    def test_dated_types_keep_the_date_on_every_page(self, base_env, alert_type):
+        """THE regression. Page 2 must key daily rows identically to page 1."""
+        mod = _load_quota_monitor(base_env)
+        day = _today()
+        page1 = [self._sk("a@x.com", alert_type, "warning", day)]
+        page2 = [self._sk("b@x.com", alert_type, "warning", day)]
+        self._paged(mod, [[{"sk": s} for s in page1], [{"sk": s} for s in page2]])
+
+        sent = mod.get_sent_alerts("September 2026")
+
+        # Both users must be deduped, not just the one that landed on page 1.
+        assert mod.alert_dedup_key("a@x.com", alert_type, "warning", day) in sent
+        assert mod.alert_dedup_key("b@x.com", alert_type, "warning", day) in sent
+
+    @pytest.mark.parametrize("alert_type", ALERT_TYPES_WITH_DATE)
+    def test_a_second_page_daily_alert_is_not_regenerated(self, base_env, alert_type):
+        """End to end: the generator must not re-emit an already-sent daily alert.
+
+        This is the user-visible symptom — a duplicate DM every 15 minutes — and
+        it fails with the old `atype == "daily"` pagination test for daily_cost.
+        """
+        mod = _load_quota_monitor(base_env)
+        day = _today()
+        email = "b@x.com"
+        # The row sits on page 2, which is where the drift lived.
+        self._paged(
+            mod,
+            [
+                [{"sk": self._sk("a@x.com", alert_type, "warning", day)}],
+                [{"sk": self._sk(email, alert_type, "warning", day)}],
+            ],
+        )
+        sent = mod.get_sent_alerts("September 2026")
+
+        over_80_not_90 = {"daily": 1_700_000, "daily_cost": 0}
+        policy = {
+            "policy_type": "default",
+            "identifier": "default",
+            "enforcement_mode": "alert",
+            "monthly_token_limit": 0,
+            "warning_threshold_80": 0,
+            "warning_threshold_90": 0,
+            "daily_token_limit": 2_000_000 if alert_type == "daily" else 0,
+            "monthly_cost_limit": 0,
+            "daily_cost_limit": 0 if alert_type == "daily" else 100.0,
+        }
+        alerts = mod.check_limits_and_generate_alerts(
+            email=email,
+            total_tokens=0,
+            daily_tokens=over_80_not_90["daily"] if alert_type == "daily" else 0,
+            policy=policy,
+            month_name="September 2026",
+            current_date=day,
+            days_remaining=19,
+            days_in_month=30,
+            sent_alerts=sent,
+            monthly_cost=0.0,
+            daily_cost=85.0 if alert_type == "daily_cost" else 0.0,
+        )
+        assert [a for a in alerts if a["alert_type"] == alert_type] == [], (
+            f"{alert_type} was re-alerted despite an existing dedup row on page 2"
+        )
+
+    @pytest.mark.parametrize("alert_type", ALERT_TYPES_NO_DATE)
+    def test_monthly_types_have_no_date_segment(self, base_env, alert_type):
+        """Monthly keys must stay undated — the query prefix already pins the month."""
+        mod = _load_quota_monitor(base_env)
+        key = mod.alert_dedup_key("a@x.com", alert_type, "exceeded")
+        assert key == f"a@x.com#{alert_type}#exceeded"
+        assert _today() not in key
+
+    def test_builder_and_parser_round_trip(self, base_env):
+        """dedup_key_from_sk must be the exact inverse of record_sent_alert's sk."""
+        mod = _load_quota_monitor(base_env)
+        day = _today()
+        for atype, date in (
+            ("monthly", None),
+            ("monthly_cost", None),
+            ("daily", day),
+            ("daily_cost", day),
+        ):
+            sk = self._sk("a@x.com", atype, "critical", date)
+            assert mod.dedup_key_from_sk(sk) == mod.alert_dedup_key("a@x.com", atype, "critical", date), (
+                f"{atype} did not round-trip"
+            )
+
+    def test_the_two_shapes_are_not_interchangeable(self, base_env):
+        """Guard the premise: if these ever collide the whole test class is vacuous."""
+        mod = _load_quota_monitor(base_env)
+        dated = mod.alert_dedup_key("a@x.com", "daily_cost", "warning", _today())
+        undated = mod.alert_dedup_key("a@x.com", "daily_cost", "warning")
+        assert dated != undated
+        assert "None" in undated  # a dated type built without a date is a bug marker
+
+    def test_undated_daily_row_is_skipped_not_guessed(self, base_env):
+        """A daily row missing its date yields no key rather than an unmatchable one."""
+        mod = _load_quota_monitor(base_env)
+        assert mod.dedup_key_from_sk(self._sk("a@x.com", "daily_cost", "warning")) is None
+
+    def test_malformed_sort_keys_are_ignored(self, base_env):
+        """A short sk must not raise inside the monitor's main loop."""
+        mod = _load_quota_monitor(base_env)
+        for sk in ("", "2026-09", "2026-09#ALERT", "2026-09#ALERT#a@x.com"):
+            assert mod.dedup_key_from_sk(sk) is None
+
+    def test_every_page_is_queried_with_the_start_key(self, base_env):
+        """Pagination must advance; a dropped ExclusiveStartKey loops forever."""
+        mod = _load_quota_monitor(base_env)
+        day = _today()
+        self._paged(
+            mod,
+            [
+                [{"sk": self._sk("a@x.com", "daily_cost", "warning", day)}],
+                [{"sk": self._sk("b@x.com", "daily_cost", "warning", day)}],
+                [{"sk": self._sk("c@x.com", "daily_cost", "warning", day)}],
+            ],
+        )
+        sent = mod.get_sent_alerts("September 2026")
+        assert len(sent) == 3
+        calls = mod.quota_table.query.call_args_list
+        assert len(calls) == 3
+        assert "ExclusiveStartKey" not in calls[0].kwargs
+        assert calls[1].kwargs["ExclusiveStartKey"]["sk"].endswith(day)

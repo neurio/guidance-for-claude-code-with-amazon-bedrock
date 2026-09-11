@@ -530,7 +530,14 @@ def lambda_handler(event, context):
                 stats["daily_exceeded"] += 1
 
             for alert in alerts:
-                alert_key = f"{email}#{alert['alert_type']}#{alert['alert_level']}"
+                # Second gate. check_limits_and_generate_alerts already applied
+                # the same test, but it built the key itself; keeping both on the
+                # shared builder is what makes this a real guard instead of the
+                # no-op it was for daily alerts (the hand-built key here omitted
+                # the date, so it could never match a dated daily entry).
+                alert_key = alert_dedup_key(
+                    email, alert["alert_type"], alert["alert_level"], alert.get("date")
+                )
                 if alert_key not in sent_alerts:
                     alerts_to_send.append(alert)
                     record_sent_alert(month_name, email, alert["alert_type"], alert["alert_level"], alert)
@@ -647,6 +654,46 @@ def resolve_user_quota(email, groups, policies_cache):
     return None
 
 
+def alert_dedup_key(email, alert_type, alert_level, date=None):
+    """THE single builder for sent-alert dedup keys. Never build one by hand.
+
+    Daily alerts are scoped to a DAY, so the date is part of the alert's
+    identity; monthly alerts are scoped to the month, which the ALERTS query
+    prefix already pins. The two shapes must therefore differ.
+
+    Six call sites used to build this string inline and they disagreed:
+    get_sent_alerts' pagination loop tested `atype == "daily"` while its first
+    page tested `atype.startswith("daily")`. So once the ALERTS query spilled to
+    a second page, a `daily_cost` row was keyed WITHOUT its date, never matched
+    the dated key the generator looks for, and the user was re-alerted every 15
+    minutes for the rest of the day. Same class of bug as
+    .claude/rules/token-endpoint-single-builder.md — one builder, no drift.
+    """
+    if alert_type.startswith("daily"):
+        return f"{email}#{alert_type}#{date}#{alert_level}"
+    return f"{email}#{alert_type}#{alert_level}"
+
+
+def dedup_key_from_sk(sk):
+    """Rebuild a dedup key from an ALERTS row's sort key, or None if unusable.
+
+    record_sent_alert writes the date LAST:
+        <month>#ALERT#<email>#<type>#<level>[#<date>]
+    so level is parts[4] and the optional date is parts[5]. Emails cannot
+    contain '#', so positional splitting is safe.
+    """
+    parts = sk.split("#")
+    if len(parts) < 5:
+        return None
+    email, atype, alevel = parts[2], parts[3], parts[4]
+    date = parts[5] if len(parts) >= 6 else None
+    if atype.startswith("daily") and date is None:
+        # A dated alert type with no date recorded: refuse to guess rather than
+        # emit a key that can never match and silently re-alert.
+        return None
+    return alert_dedup_key(email, atype, alevel, date)
+
+
 def check_limits_and_generate_alerts(email, total_tokens, daily_tokens, policy,
                                      month_name, current_date, days_remaining, days_in_month, sent_alerts,
                                      monthly_cost=0.0, daily_cost=0.0):
@@ -671,7 +718,7 @@ def check_limits_and_generate_alerts(email, total_tokens, daily_tokens, policy,
         elif total_tokens > policy["warning_threshold_80"]:
             level = "warning"
 
-    if level and f"{email}#monthly#{level}" not in sent_alerts:
+    if level and alert_dedup_key(email, "monthly", level) not in sent_alerts:
         alerts.append({
             "user": email, "alert_type": "monthly", "alert_level": level,
             "current_usage": int(total_tokens), "limit": monthly_limit,
@@ -691,7 +738,7 @@ def check_limits_and_generate_alerts(email, total_tokens, daily_tokens, policy,
             dlevel = "critical"
         elif daily_tokens > (daily_limit * 0.8):
             dlevel = "warning"
-        if dlevel and f"{email}#daily#{current_date}#{dlevel}" not in sent_alerts:
+        if dlevel and alert_dedup_key(email, "daily", dlevel, current_date) not in sent_alerts:
             alerts.append({
                 "user": email, "alert_type": "daily", "alert_level": dlevel,
                 "current_usage": int(daily_tokens), "limit": daily_limit,
@@ -711,7 +758,7 @@ def check_limits_and_generate_alerts(email, total_tokens, daily_tokens, policy,
             clevel = "critical"
         elif monthly_cost > monthly_cost_limit * 0.8:
             clevel = "warning"
-        if clevel and f"{email}#monthly_cost#{clevel}" not in sent_alerts:
+        if clevel and alert_dedup_key(email, "monthly_cost", clevel) not in sent_alerts:
             alerts.append({
                 "user": email, "alert_type": "monthly_cost", "alert_level": clevel,
                 "current_usage": round(monthly_cost, 2), "limit": monthly_cost_limit,
@@ -730,7 +777,7 @@ def check_limits_and_generate_alerts(email, total_tokens, daily_tokens, policy,
             dclevel = "critical"
         elif daily_cost > daily_cost_limit * 0.8:
             dclevel = "warning"
-        if dclevel and f"{email}#daily_cost#{current_date}#{dclevel}" not in sent_alerts:
+        if dclevel and alert_dedup_key(email, "daily_cost", dclevel, current_date) not in sent_alerts:
             alerts.append({
                 "user": email, "alert_type": "daily_cost", "alert_level": dclevel,
                 "current_usage": round(daily_cost, 2), "limit": daily_cost_limit,
@@ -745,30 +792,20 @@ def get_sent_alerts(month_name):
     sent = set()
     try:
         month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
-        response = quota_table.query(
-            KeyConditionExpression=Key("pk").eq("ALERTS") & Key("sk").begins_with(f"{month_prefix}#ALERT#")
-        )
-        for item in response.get("Items", []):
-            parts = item["sk"].split("#")
-            if len(parts) >= 5:
-                email, atype, alevel = parts[2], parts[3], parts[4]
-                if atype.startswith("daily") and len(parts) >= 6:
-                    sent.add(f"{email}#{atype}#{parts[5]}#{alevel}")
-                else:
-                    sent.add(f"{email}#{atype}#{alevel}")
-        while "LastEvaluatedKey" in response:
-            response = quota_table.query(
-                KeyConditionExpression=Key("pk").eq("ALERTS") & Key("sk").begins_with(f"{month_prefix}#ALERT#"),
-                ExclusiveStartKey=response["LastEvaluatedKey"],
-            )
+        key_condition = Key("pk").eq("ALERTS") & Key("sk").begins_with(f"{month_prefix}#ALERT#")
+        kwargs = {}
+        # One loop for every page. This used to be the first page plus a copy
+        # inside the while, and the copy drifted — see alert_dedup_key.
+        while True:
+            response = quota_table.query(KeyConditionExpression=key_condition, **kwargs)
             for item in response.get("Items", []):
-                parts = item["sk"].split("#")
-                if len(parts) >= 5:
-                    email, atype, alevel = parts[2], parts[3], parts[4]
-                    if atype == "daily" and len(parts) >= 6:
-                        sent.add(f"{email}#{atype}#{parts[5]}#{alevel}")
-                    else:
-                        sent.add(f"{email}#{atype}#{alevel}")
+                key = dedup_key_from_sk(item["sk"])
+                if key:
+                    sent.add(key)
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            kwargs["ExclusiveStartKey"] = last_key
     except Exception as e:
         print(f"Error checking sent alerts: {e}")
     return sent
@@ -778,6 +815,9 @@ def record_sent_alert(month_name, email, alert_type, alert_level, alert_data):
     """Record sent alert to prevent duplicates."""
     try:
         month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
+        # dedup_key_from_sk is the inverse of this: it reads level from parts[4]
+        # and the optional date from parts[5]. Keep the date LAST, and keep the
+        # `startswith("daily")` test in step with alert_dedup_key.
         if alert_type.startswith("daily"):
             date = alert_data.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
             sk = f"{month_prefix}#ALERT#{email}#{alert_type}#{alert_level}#{date}"
