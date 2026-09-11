@@ -34,6 +34,17 @@ from tests.cfn_yaml import INFRA_DIR, load_resolved
 QUOTA_TEMPLATE = INFRA_DIR / "quota-monitoring.yaml"
 
 
+@pytest.fixture(autouse=True)
+def no_alert_clearing():
+    """set-user also resets the user's alert history; that has its own test file.
+
+    Without this the CLI cases would reach real DynamoDB through the MagicMock
+    profile's table name.
+    """
+    with patch("claude_code_with_bedrock.cli.commands.quota._clear_sent_alerts", return_value=0):
+        yield
+
+
 def _ttl_update_calls(mock_manager):
     """The update_item calls that touched the ttl attribute, as kwargs dicts."""
     return [

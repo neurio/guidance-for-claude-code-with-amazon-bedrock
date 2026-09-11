@@ -713,12 +713,38 @@ poetry run ccwb quota set-user <email> [options]
 - `--enforcement, -e <mode>` - Enforcement mode: `alert` (monitor only) or `block` (deny access)
 - `--disabled` - Create policy in disabled state
 - `--expires-month-end` - Delete this policy after the current month (temporary override)
+- `--keep-alerts` - Keep this month's triggered alerts (default: clear them)
 - `--profile, -p <name>` - Configuration profile
 
 **Example:**
 ```bash
 poetry run ccwb quota set-user alice@example.com -m 5M -e block
 ```
+
+**Alert history is reset:**
+
+The quota monitor sends each threshold alert once per month per user, remembering
+what it already sent. Those records describe crossings of the *old* limits, so
+changing a user's policy clears this month's triggered alerts for that user —
+otherwise a user whose budget was raised could blow through the new budget with
+no alert and no Slack DM.
+
+```
+Updated existing user quota policy for bill@example.com
+  Monthly limit: 0
+  Monthly cost limit: $2500.00
+  Enforcement: alert (monthly), alert (daily)
+  Cleared 2 triggered alerts for this month (the new limits can alert again)
+```
+
+Notes:
+- Only that user's alerts, and only the current month's, are cleared. Group and
+  default policy changes never clear alert history.
+- Pass `--keep-alerts` to leave it alone (e.g. a cosmetic edit where you don't
+  want thresholds already announced to be announced again).
+- If the clear fails, the command reports it and exits non-zero even though the
+  policy was saved — a suppressed alert is otherwise invisible. Re-running the
+  command retries it.
 
 **Temporary overrides:**
 

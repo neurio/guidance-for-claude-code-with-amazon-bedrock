@@ -11,6 +11,8 @@ from pathlib import Path
 
 import boto3
 import questionary
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 from cleo.commands.command import Command
 from cleo.helpers import argument, option
 from rich import box
@@ -291,6 +293,128 @@ def _write_policy_ttl(
     return ttl
 
 
+def _sent_alert_email(sk: str) -> str | None:
+    """The email inside an ALERTS sort key, or None if the row is not one.
+
+    Inverse of quota_monitor's ``record_sent_alert``, which writes:
+
+        <YYYY-MM>#ALERT#<email>#<type>#<level>[#<date>]
+
+    Emails cannot contain '#', so positional splitting is safe — the same
+    assumption ``dedup_key_from_sk`` makes on the Lambda side.
+    """
+    parts = sk.split("#")
+    if len(parts) < 5 or parts[1] != "ALERT":
+        return None
+    return parts[2]
+
+
+def _clear_sent_alerts(profile, email: str, now: datetime | None = None) -> int:
+    """Delete this month's sent-alert dedup rows for one user.
+
+    quota_monitor records every alert it sends as an ``ALERTS`` row and refuses
+    to send anything whose row already exists (see ``alert_dedup_key``). Each row
+    means "this level was crossed under the budget in force at the time". Once
+    the budget changes, the same level can legitimately be crossed again and must
+    be able to alert again — otherwise an admin raises a budget, the user blows
+    through the *new* one, and neither the Slack DM nor the SNS alert ever fires.
+
+    Only the current month is touched: ``get_sent_alerts`` queries a single
+    ``<YYYY-MM>#ALERT#`` prefix, so older rows can no longer suppress anything
+    (and carry their own 60-day TTL).
+
+    Matching on the email is case-insensitive. The sort key carries whatever
+    casing the OIDC ``email`` claim had, which need not match what the admin
+    typed on the command line.
+
+    Args:
+        profile: Configuration profile (supplies table name and region).
+        email: User whose alert history to clear.
+        now: Reference time for the month prefix (defaults to now, UTC).
+
+    Returns:
+        Number of alert rows deleted.
+
+    Raises:
+        ClientError: Propagated from DynamoDB so the caller can distinguish a
+            missing table from a real failure.
+    """
+    table_name = profile.user_quota_metrics_table or "UserQuotaMetrics"
+    dynamodb = boto3.resource("dynamodb", region_name=profile.aws_region)
+    table = dynamodb.Table(table_name)
+
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    month_prefix = reference.astimezone(timezone.utc).strftime("%Y-%m")
+
+    key_condition = Key("pk").eq("ALERTS") & Key("sk").begins_with(f"{month_prefix}#ALERT#")
+    target = email.lower()
+    stale: list[str] = []
+    kwargs: dict = {}
+
+    # Paginate: the ALERTS partition holds every user's alerts for the month, so
+    # a single page is not guaranteed to contain this user's rows.
+    while True:
+        response = table.query(KeyConditionExpression=key_condition, **kwargs)
+        for item in response.get("Items", []):
+            sk = item.get("sk", "")
+            row_email = _sent_alert_email(sk)
+            if row_email and row_email.lower() == target:
+                stale.append(sk)
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+
+    if stale:
+        with table.batch_writer() as batch:
+            for sk in stale:
+                batch.delete_item(Key={"pk": "ALERTS", "sk": sk})
+
+    return len(stale)
+
+
+def _clear_alerts_after_policy_change(console, profile, email: str, keep_alerts: bool) -> bool:
+    """Reset the user's alert dedup state after writing their policy.
+
+    Returns True if the alert history is in the intended state, False if the
+    clear was attempted and failed. A failure is reported and made non-zero
+    rather than swallowed: the symptom is a *missing* alert, which nobody
+    notices until an unbudgeted month lands.
+    """
+    if keep_alerts:
+        console.print(
+            "[dim]  Kept alert history (--keep-alerts): levels already alerted this month stay suppressed.[/dim]"
+        )
+        return True
+
+    try:
+        cleared = _clear_sent_alerts(profile, email)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+            # Quota monitoring isn't deployed — there is no alert history to be stale.
+            console.print("[dim]  No quota metrics table found; no alert history to clear.[/dim]")
+            return True
+        console.print(f"[red]  Failed to clear triggered alerts for {email}: {e}[/red]")
+        console.print("[red]  The policy was saved, but alerts already sent this month remain suppressed.[/red]")
+        console.print(f"[red]  Re-run the command to retry, or delete the ALERTS rows for {email} manually.[/red]")
+        return False
+    except Exception as e:
+        console.print(f"[red]  Failed to clear triggered alerts for {email}: {e}[/red]")
+        console.print("[red]  The policy was saved, but alerts already sent this month remain suppressed.[/red]")
+        return False
+
+    if cleared:
+        console.print(
+            f"  Cleared {cleared} triggered alert{'' if cleared == 1 else 's'} for this month "
+            "(the new limits can alert again)"
+        )
+    else:
+        console.print("[dim]  No triggered alerts to clear this month[/dim]")
+    return True
+
+
 def _print_ttl_notice(console, ttl: int | None) -> None:
     """Report a stamped expiry, including the deletion lag admins should expect."""
     if not ttl:
@@ -367,6 +491,12 @@ class QuotaSetCommand(Command):
             description="Delete this policy after the current month (users only)",
             flag=True,
         ),
+        option(
+            "keep-alerts",
+            None,
+            description="Keep this month's triggered alerts (users only)",
+            flag=True,
+        ),
     ]
 
     def handle(self) -> int:
@@ -375,6 +505,7 @@ class QuotaSetCommand(Command):
         is_group = self.option("group")
         is_default = self.option("default")
         expires_month_end = self.option("expires-month-end")
+        keep_alerts = self.option("keep-alerts")
 
         if is_default and is_group:
             self.line("<error>Cannot use both --default and --group</error>")
@@ -385,6 +516,14 @@ class QuotaSetCommand(Command):
         if expires_month_end and (is_group or is_default):
             scope = "group" if is_group else "default"
             self.line(f"<error>--expires-month-end is only valid for user policies, not --{scope}</error>")
+            return 1
+
+        # Refuse rather than accept-as-no-op: the flag would imply that group and
+        # default writes clear alert history by default, which they never do
+        # (there is no single user whose ALERTS rows they could reset).
+        if keep_alerts and (is_group or is_default):
+            scope = "group" if is_group else "default"
+            self.line(f"<error>--keep-alerts is only valid for user policies, not --{scope}</error>")
             return 1
 
         # Build option args to pass through
@@ -407,6 +546,8 @@ class QuotaSetCommand(Command):
             pass_opts.append("--disabled")
         if expires_month_end:
             pass_opts.append("--expires-month-end")
+        if keep_alerts:
+            pass_opts.append("--keep-alerts")
 
         opts_str = " ".join(pass_opts)
 
@@ -453,6 +594,11 @@ class QuotaSetUserCommand(Command):
         option(
             "expires-month-end",
             description="Delete this policy after the current month (temporary override)",
+            flag=True,
+        ),
+        option(
+            "keep-alerts",
+            description="Keep this month's triggered alerts (default: clear them so new limits can alert)",
             flag=True,
         ),
     ]
@@ -542,6 +688,7 @@ class QuotaSetUserCommand(Command):
                 return 1
 
         expires_month_end = self.option("expires-month-end")
+        keep_alerts = self.option("keep-alerts")
 
         try:
             manager = _get_quota_manager(profile)
@@ -576,6 +723,11 @@ class QuotaSetUserCommand(Command):
                 f"  Enforcement: {policy.enforcement_mode.value} (monthly), {policy.daily_enforcement_mode.value} (daily)"
             )
             _print_ttl_notice(console, ttl)
+            # A first-time user policy still needs the reset: until now the user
+            # was alerted against the group or default budget, and those rows
+            # suppress the same levels under the policy just created.
+            if not _clear_alerts_after_policy_change(console, profile, email, keep_alerts):
+                return 1
             return 0
 
         except PolicyAlreadyExistsError:
@@ -607,6 +759,8 @@ class QuotaSetUserCommand(Command):
                     f"  Enforcement: {policy.enforcement_mode.value} (monthly), {policy.daily_enforcement_mode.value} (daily)"
                 )
                 _print_ttl_notice(console, ttl)
+                if not _clear_alerts_after_policy_change(console, profile, email, keep_alerts):
+                    return 1
                 return 0
             except QuotaPolicyError as e:
                 console.print(f"[red]Failed to update policy: {e}[/red]")

@@ -376,6 +376,11 @@ This alert is sent once per threshold level per month.
 
 Alerts are deduplicated - each threshold triggers only once per user per period, with history stored in DynamoDB (60-day TTL).
 
+Because that history records crossings of the limits in force at the time, `ccwb quota set-user`
+clears the current month's alert history for the user whose policy it writes. Without the reset, a
+user whose budget was raised mid-month could exceed the new budget with no alert. Pass
+`--keep-alerts` to leave the history in place; group and default policy changes never touch it.
+
 ## User Notifications
 
 When users approach or exceed their quota limits, they receive visual notifications in both the terminal and browser.
@@ -554,7 +559,7 @@ aws dynamodb scan --table-name QuotaPolicies \
 ### Common Issues
 
 - **No alerts**: Verify SNS subscriptions are confirmed and EventBridge rule is enabled. A topic with zero subscriptions swallows every alert silently — `publish` succeeds, nobody is notified. Check with `aws sns list-subscriptions-by-topic`.
-- **Alerts stop after the first one per user**: expected. Alerts are deduplicated per month by `{email}#{alert_type}#{level}`, recorded under `pk=ALERTS`. A user already alerted at `warning` will not re-alert at `warning` again this month, but will still alert when they cross `critical` and `exceeded`.
+- **Alerts stop after the first one per user**: expected. Alerts are deduplicated per month by `{email}#{alert_type}#{level}`, recorded under `pk=ALERTS`. A user already alerted at `warning` will not re-alert at `warning` again this month, but will still alert when they cross `critical` and `exceeded`. `ccwb quota set-user` clears these rows for the user it writes, so a budget change re-arms every level.
 - **Missing users**: Check JWT tokens include email claim
 - **Wrong policy applied**: Verify group claims are present in JWT tokens
 - **Groups not detected**: Check that `ENABLE_FINEGRAINED_QUOTAS` is set to `true`
