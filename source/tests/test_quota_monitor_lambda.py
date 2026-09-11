@@ -240,11 +240,16 @@ class TestPolicyPagination:
 
     def _policy_item(self, policy_type, identifier, monthly_cost=None):
         item = {
-            "pk": f"POLICY#{policy_type}#{identifier}", "sk": "CURRENT",
-            "policy_type": policy_type, "identifier": identifier,
-            "monthly_token_limit": 0, "daily_token_limit": 0,
-            "warning_threshold_80": 0, "warning_threshold_90": 0,
-            "enforcement_mode": "alert", "enabled": True,
+            "pk": f"POLICY#{policy_type}#{identifier}",
+            "sk": "CURRENT",
+            "policy_type": policy_type,
+            "identifier": identifier,
+            "monthly_token_limit": 0,
+            "daily_token_limit": 0,
+            "warning_threshold_80": 0,
+            "warning_threshold_90": 0,
+            "enforcement_mode": "alert",
+            "enabled": True,
         }
         if monthly_cost is not None:
             item["monthly_cost_limit"] = Decimal(str(monthly_cost))
@@ -257,30 +262,43 @@ class TestPolicyPagination:
 
     def test_cost_limits_survive_a_paginated_scan(self, base_env):
         mod = _load_quota_monitor(base_env)
-        policies = self._paged(mod, [
-            {"Items": [self._policy_item("default", "default", 1000)],
-             "LastEvaluatedKey": {"pk": "POLICY#default#default", "sk": "CURRENT"}},
-            {"Items": [self._policy_item("user", "big.spender@example.com", 2500)]},
-        ])
+        policies = self._paged(
+            mod,
+            [
+                {
+                    "Items": [self._policy_item("default", "default", 1000)],
+                    "LastEvaluatedKey": {"pk": "POLICY#default#default", "sk": "CURRENT"},
+                },
+                {"Items": [self._policy_item("user", "big.spender@example.com", 2500)]},
+            ],
+        )
         assert policies["default:default"]["monthly_cost_limit"] == 1000.0
         # The page-2 policy is the one the old code silently zeroed.
         assert policies["user:big.spender@example.com"]["monthly_cost_limit"] == 2500.0
 
     def test_every_page_uses_the_same_policy_shape(self, base_env):
         mod = _load_quota_monitor(base_env)
-        policies = self._paged(mod, [
-            {"Items": [self._policy_item("default", "default", 1000)],
-             "LastEvaluatedKey": {"pk": "POLICY#default#default", "sk": "CURRENT"}},
-            {"Items": [self._policy_item("user", "second.page@example.com", 50)]},
-        ])
+        policies = self._paged(
+            mod,
+            [
+                {
+                    "Items": [self._policy_item("default", "default", 1000)],
+                    "LastEvaluatedKey": {"pk": "POLICY#default#default", "sk": "CURRENT"},
+                },
+                {"Items": [self._policy_item("user", "second.page@example.com", 50)]},
+            ],
+        )
         assert set(policies["default:default"]) == set(policies["user:second.page@example.com"])
 
     def test_pagination_carries_the_filter_and_the_start_key(self, base_env):
         mod = _load_quota_monitor(base_env)
-        self._paged(mod, [
-            {"Items": [], "LastEvaluatedKey": {"pk": "POLICY#a#b", "sk": "CURRENT"}},
-            {"Items": []},
-        ])
+        self._paged(
+            mod,
+            [
+                {"Items": [], "LastEvaluatedKey": {"pk": "POLICY#a#b", "sk": "CURRENT"}},
+                {"Items": []},
+            ],
+        )
         first, second = mod.policies_table.scan.call_args_list
         assert "FilterExpression" in first.kwargs
         assert "ExclusiveStartKey" not in first.kwargs
@@ -291,11 +309,16 @@ class TestPolicyPagination:
     def test_stops_when_no_start_key_is_returned(self, base_env):
         """side_effect raises StopIteration if the loop scans a third time."""
         mod = _load_quota_monitor(base_env)
-        policies = self._paged(mod, [
-            {"Items": [self._policy_item("default", "default", 1000)],
-             "LastEvaluatedKey": {"pk": "POLICY#default#default", "sk": "CURRENT"}},
-            {"Items": [self._policy_item("user", "last@example.com", 10)]},
-        ])
+        policies = self._paged(
+            mod,
+            [
+                {
+                    "Items": [self._policy_item("default", "default", 1000)],
+                    "LastEvaluatedKey": {"pk": "POLICY#default#default", "sk": "CURRENT"},
+                },
+                {"Items": [self._policy_item("user", "last@example.com", 10)]},
+            ],
+        )
         assert mod.policies_table.scan.call_count == 2
         assert len(policies) == 2
 
@@ -342,18 +365,26 @@ class TestSummaryCounters:
         return json.loads(result["body"])
 
     def _item(self, email, cost):
-        return {"email": email, "estimated_cost": cost, "total_tokens": 1_000_000,
-                "daily_tokens": 0, "daily_date": _today()}
+        return {
+            "email": email,
+            "estimated_cost": cost,
+            "total_tokens": 1_000_000,
+            "daily_tokens": 0,
+            "daily_date": _today(),
+        }
 
     def test_counts_the_cost_ladder_not_tokens(self, base_env):
         mod = _load_quota_monitor(base_env)
-        stats = self._run(mod, [
-            self._item("under@example.com", 100.00),      # 10%
-            self._item("warn@example.com", 850.00),        # 85%
-            self._item("critical@example.com", 950.00),    # 95%
-            self._item("over@example.com", 3405.83),       # 340%
-            self._item("also.over@example.com", 1449.22),  # 145%
-        ])
+        stats = self._run(
+            mod,
+            [
+                self._item("under@example.com", 100.00),  # 10%
+                self._item("warn@example.com", 850.00),  # 85%
+                self._item("critical@example.com", 950.00),  # 95%
+                self._item("over@example.com", 3405.83),  # 340%
+                self._item("also.over@example.com", 1449.22),  # 145%
+            ],
+        )
         assert stats["limit_basis"] == "cost"
         assert stats["total_users"] == 5
         assert stats["over_80"] == 1
@@ -362,10 +393,13 @@ class TestSummaryCounters:
 
     def test_reports_mtd_spend_total(self, base_env):
         mod = _load_quota_monitor(base_env)
-        stats = self._run(mod, [
-            self._item("a@example.com", 100.50),
-            self._item("b@example.com", 200.25),
-        ])
+        stats = self._run(
+            mod,
+            [
+                self._item("a@example.com", 100.50),
+                self._item("b@example.com", 200.25),
+            ],
+        )
         assert stats["monthly_cost_total"] == 300.75
 
     def test_falls_back_to_tokens_when_no_cost_budget(self, base_env):
@@ -829,3 +863,108 @@ class TestNoPromqlSurfaceRemains:
             line for line in source.splitlines() if line.startswith("import pg8000") or line.startswith("from pg8000")
         ]
         assert module_level == [], "pg8000 must be imported inside _db_connect"
+
+
+class TestAlertMessageAttributes:
+    """The SNS routing contract consumed by quota_slack_notifier.
+
+    The Message body is free text for human email subscribers, so the machine
+    readable copy of each alert rides along as MessageAttributes. Two properties
+    matter and neither is visible in a normal deploy:
+
+    - `alert_type` must be present on every per-user alert. The Slack
+      subscription's FilterPolicy names it, and an SNS FilterPolicy naming an
+      attribute the message does NOT carry is a NON-match — dropping the
+      attribute here would silence every DM with zero errors anywhere.
+    - Operator alerts must keep publishing NO attributes at all. That missing
+      attribute non-match is the only thing stopping end users from being DM'd
+      about a TimescaleDB safety-floor trip.
+    """
+
+    COST_ALERT = {
+        "user": "Cameron.Johnson@generac.com",
+        "alert_type": "monthly_cost",
+        "alert_level": "warning",
+        "current_usage": 85.0,
+        "limit": 100.0,
+        "percentage": 85.0,
+        "policy_info": "default:default",
+        "enforcement_mode": "alert",
+    }
+
+    def _publish(self, base_env, alert):
+        mod = _load_quota_monitor(base_env)
+        mod.sns_client = MagicMock()
+        mod.send_alerts([alert])
+        assert mod.sns_client.publish.call_count == 1, "alert was swallowed"
+        return mod, mod.sns_client.publish.call_args.kwargs
+
+    def test_all_five_attributes_present_and_non_empty(self, base_env):
+        _, kwargs = self._publish(base_env, dict(self.COST_ALERT))
+        attrs = kwargs["MessageAttributes"]
+        assert set(attrs) == {
+            "alert_kind",
+            "alert_type",
+            "alert_level",
+            "user_email",
+            "alert_payload",
+        }
+        for name, spec in attrs.items():
+            # SNS rejects an empty or non-string StringValue outright.
+            assert spec["DataType"] == "String", name
+            assert isinstance(spec["StringValue"], str) and spec["StringValue"], name
+
+    def test_routing_attributes_carry_the_filterable_values(self, base_env):
+        _, kwargs = self._publish(base_env, dict(self.COST_ALERT))
+        attrs = kwargs["MessageAttributes"]
+        assert attrs["alert_kind"]["StringValue"] == "user_quota"
+        assert attrs["alert_type"]["StringValue"] == "monthly_cost"
+        assert attrs["alert_level"]["StringValue"] == "warning"
+        assert attrs["user_email"]["StringValue"] == "Cameron.Johnson@generac.com"
+
+    def test_user_email_keeps_its_original_casing(self, base_env):
+        """pk uses the raw OIDC claim casing; the notifier lowercases on compare."""
+        _, kwargs = self._publish(base_env, dict(self.COST_ALERT))
+        assert "Cameron.Johnson" in kwargs["MessageAttributes"]["user_email"]["StringValue"]
+
+    def test_payload_round_trips(self, base_env):
+        alert = dict(self.COST_ALERT, month="September 2026", days_remaining=20)
+        _, kwargs = self._publish(base_env, alert)
+        assert json.loads(kwargs["MessageAttributes"]["alert_payload"]["StringValue"]) == alert
+
+    def test_decimal_usage_does_not_lose_the_alert(self, base_env):
+        """DynamoDB hands back Decimal; a raw json.dumps would raise in-loop."""
+        alert = dict(self.COST_ALERT, current_usage=Decimal("85.5"), limit=Decimal("100"))
+        _, kwargs = self._publish(base_env, alert)
+        payload = json.loads(kwargs["MessageAttributes"]["alert_payload"]["StringValue"])
+        assert payload["current_usage"] == "85.5"
+
+    @pytest.mark.parametrize("alert_type", ["monthly", "daily"])
+    def test_token_alerts_stay_outside_the_slack_filter_set(self, base_env, alert_type):
+        """Token quota alerts publish attributes too, but a value the
+        FilterPolicy does not list — so they never invoke the notifier."""
+        alert = dict(self.COST_ALERT, alert_type=alert_type, current_usage=1_000_000, limit=2_000_000)
+        _, kwargs = self._publish(base_env, alert)
+        value = kwargs["MessageAttributes"]["alert_type"]["StringValue"]
+        assert value == alert_type
+        assert value not in ("monthly_cost", "daily_cost")
+
+    def test_subject_and_message_are_byte_identical_to_before(self, base_env):
+        """Email subscribers predate the attributes; the body is the contract."""
+        _, kwargs = self._publish(base_env, dict(self.COST_ALERT))
+        assert kwargs["Subject"] == "Claude Code WARNING - Monthly Spend Budget - 85%"
+        assert kwargs["Message"] == (
+            "USER: Cameron.Johnson@generac.com\n"
+            "ALERT: Monthly Spend Budget - WARNING\n"
+            "Usage: $85.00 / $100.00 (85.0%)\n"
+            "Policy: default:default\n"
+            "Enforcement: alert"
+        )
+
+    def test_operational_alerts_publish_no_attributes(self, base_env):
+        """The missing-attribute non-match is what excludes operator alerts."""
+        mod = _load_quota_monitor(base_env)
+        mod.sns_client = MagicMock()
+        mod._publish_operational_alert("Safety floor tripped", "details")
+        kwargs = mod.sns_client.publish.call_args.kwargs
+        assert "MessageAttributes" not in kwargs

@@ -208,12 +208,49 @@ Parameters:
       identities than this fraction of the existing DynamoDB rows, the monitor
       refuses to write and alerts instead of zeroing real usage.
 
+  # Slack DM notifier for spend-budget alerts. An empty secret ARN disables the
+  # feature outright (no role, no function, no subscription) — same "empty
+  # string disables" idiom as TelemetryDbSecretArn above.
+  SlackBotTokenSecretArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Full ARN of the Secrets Manager secret holding the Slack bot token,
+      including the random suffix. The secret may be either a bare token string
+      or a JSON object with the token under bot_token / token / slack_bot_token.
+      Required bot scopes: users:read, users:read.email, chat:write. Leave empty
+      to disable Slack DM notifications entirely.
+
+  SlackDmAllowlist:
+    Type: String
+    Default: 'Cameron.Johnson@generac.com'
+    Description: >-
+      Comma-separated recipient emails allowed to receive a Slack DM. Compared
+      case-insensitively, since quota alerts carry the original OIDC email
+      casing. Any other recipient is logged and skipped without a Slack API
+      call. An EMPTY list blocks everyone — it does not mean "allow all".
+
+  SlackApiTimeoutSeconds:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+    Description: Per-request timeout for slack.com API calls
+
+  SlackDmHelpUrl:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional link included in the DM for requesting a budget increase
+      (runbook, ticket form). Leave empty to omit the line.
+
 Conditions:
   HasJwtAuth: !Not [!Equals [!Ref OidcIssuerUrl, '']]
   NoJwtAuth: !Equals [!Ref OidcIssuerUrl, '']
   BypassDetectionEnabled: !Equals [!Ref EnableBypassDetection, 'true']
   HasTelemetryDb: !Not [!Equals [!Ref TelemetryDbSecretArn, '']]
   HasTelemetryDbEgressCidr: !Not [!Equals [!Ref TelemetryDbEgressCidr, '']]
+  SlackNotifierEnabled: !Not [!Equals [!Ref SlackBotTokenSecretArn, '']]
 
 Resources:
   # DynamoDB table for quota policies (user, group, default levels)
@@ -563,6 +600,110 @@ Resources:
   # ============================================
 
   # ============================================
+  # Quota Cost-Alert Slack Notifier
+  # Subscribes to QuotaAlertTopic and DMs the affected user on Slack.
+  # The subscription FilterPolicy limits invocations to monthly_cost/daily_cost
+  # alerts, so token-quota alerts and operator alerts never reach this function
+  # and there is no in-code alert-type check to keep in sync.
+  # ============================================
+
+  QuotaSlackNotifierRole:
+    Type: AWS::IAM::Role
+    Condition: SlackNotifierEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: QuotaSlackNotifierPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The only non-logging AWS call this function makes. No
+              # placeholder-ARN !If is needed here (unlike QuotaMonitorRole
+              # above): the whole role is conditional on the ARN being
+              # non-empty, so Resource can never be an empty string.
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref SlackBotTokenSecretArn
+
+  QuotaSlackNotifierFunction:
+    Type: AWS::Lambda::Function
+    Condition: SlackNotifierEnabled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Must reach slack.com. Attaching this to the telemetry VPC would
+              require a NAT path to a public HTTPS endpoint and add a failure
+              mode; the function exposes no inbound surface.
+          - id: W92
+            reason: >-
+              Invoked only on spend-budget alerts, bounded by the quota_monitor
+              dedup table to one per user/threshold/period, so reserved
+              concurrency is unnecessary.
+    Properties:
+      FunctionName: claude-code-quota-slack-notifier
+      Description: DMs the affected user on Slack when a Bedrock spend budget threshold is crossed
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt QuotaSlackNotifierRole.Arn
+      # Two Slack calls, each with one bounded retry on a 429 Retry-After
+      # (capped at 20s in code), plus a cold Secrets Manager fetch.
+      Timeout: 60
+      MemorySize: 256
+      # Deliberately NOT VPC-attached — see the W89 suppression above.
+      Environment:
+        Variables:
+          SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
+          SLACK_DM_ALLOWLIST: !Ref SlackDmAllowlist
+          SLACK_API_TIMEOUT_SECONDS: !Ref SlackApiTimeoutSeconds
+          SLACK_DM_HELP_URL: !Ref SlackDmHelpUrl
+      Code: ./lambda-functions/quota_slack_notifier/
+
+  QuotaSlackNotifierPermission:
+    Type: AWS::Lambda::Permission
+    Condition: SlackNotifierEnabled
+    Properties:
+      FunctionName: !Ref QuotaSlackNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref QuotaAlertTopic
+
+  QuotaSlackNotifierSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: SlackNotifierEnabled
+    # A genuine ordering dependency, not an implicit Ref/GetAtt one: neither
+    # resource references the other, but SNS accepts the subscription and then
+    # fails delivery until the invoke permission exists.
+    DependsOn: QuotaSlackNotifierPermission
+    Properties:
+      TopicArn: !Ref QuotaAlertTopic
+      Protocol: lambda
+      Endpoint: !GetAtt QuotaSlackNotifierFunction.Arn
+      # Filters on message attributes (the default scope). A message that does
+      # NOT carry an `alert_type` attribute is a NON-match, which is exactly how
+      # operator alerts (_publish_operational_alert) and sidecar bypass alerts
+      # are excluded — they publish no attributes at all. Token-quota alerts
+      # carry alert_type "monthly"/"daily" and so also do not match.
+      FilterPolicy:
+        alert_type:
+          - monthly_cost
+          - daily_cost
+
+  # ============================================
+  # End Quota Cost-Alert Slack Notifier
+  # ============================================
+
+  # ============================================
   # Quota Check API (Phase 2 - Access Blocking)
   # ============================================
 
@@ -766,6 +907,13 @@ Outputs:
     Value: !GetAtt SidecarMonitorFunction.Arn
     Export:
       Name: !Sub '${AWS::StackName}-SidecarMonitorFunctionArn'
+
+  QuotaSlackNotifierFunctionArn:
+    Condition: SlackNotifierEnabled
+    Description: ARN of the Lambda that DMs users on Slack for spend-budget alerts
+    Value: !GetAtt QuotaSlackNotifierFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaSlackNotifierFunctionArn'
 
   QuotaApiInvokePolicyArn:
     Condition: NoJwtAuth

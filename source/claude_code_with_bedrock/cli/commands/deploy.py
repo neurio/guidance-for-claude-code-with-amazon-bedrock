@@ -1379,6 +1379,12 @@ class DeployCommand(Command):
                     f"TelemetryDbEgressCidr={getattr(profile, 'telemetry_db_egress_cidr', None) or ''}",
                     f"QuotaWriteMode={getattr(profile, 'quota_write_mode', None) or 'shadow'}",
                     f"QuotaDbMinRowRatio={getattr(profile, 'quota_db_min_row_ratio', 0.5)}",
+                    # Slack DM notifier. Passed on every deploy even when empty:
+                    # deploy_stack does not use UsePreviousValue, so a parameter
+                    # missing from this list is reset to its template default —
+                    # which would silently delete the notifier and subscription.
+                    f"SlackBotTokenSecretArn={getattr(profile, 'slack_bot_token_secret_arn', None) or ''}",
+                    f"SlackDmAllowlist={getattr(profile, 'slack_dm_allowlist', None) or ''}",
                 ]
 
                 if not telemetry_db_secret_arn:

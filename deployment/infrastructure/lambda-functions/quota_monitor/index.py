@@ -794,6 +794,32 @@ def record_sent_alert(month_name, email, alert_type, alert_level, alert_data):
         print(f"Error recording alert: {e}")
 
 
+def _alert_message_attributes(alert):
+    """SNS message attributes carrying the machine-readable copy of an alert.
+
+    The Message body stays free text for human email subscribers; these
+    attributes let subscribers route without parsing prose. The Slack notifier
+    subscribes with FilterPolicy {"alert_type": ["monthly_cost", "daily_cost"]},
+    so token-quota alerts and operator alerts never invoke it.
+
+    IMPORTANT: an SNS FilterPolicy naming an attribute the message does NOT
+    carry is a NON-match. That is exactly how _publish_operational_alert and
+    sidecar_monitor are excluded — they publish no attributes at all. It also
+    means dropping "alert_type" here silently stops every Slack DM, so keep it.
+
+    default=str on the payload dump is deliberate insurance: usage values are
+    floats today, but a DynamoDB Decimal leaking in would otherwise raise
+    inside the alert loop and lose the alert entirely.
+    """
+    return {
+        "alert_kind": {"DataType": "String", "StringValue": "user_quota"},
+        "alert_type": {"DataType": "String", "StringValue": str(alert["alert_type"])},
+        "alert_level": {"DataType": "String", "StringValue": str(alert["alert_level"])},
+        "user_email": {"DataType": "String", "StringValue": str(alert["user"])},
+        "alert_payload": {"DataType": "String", "StringValue": json.dumps(alert, default=str)},
+    }
+
+
 def send_alerts(alerts):
     """Send alerts via SNS."""
     if not SNS_TOPIC_ARN:
@@ -817,6 +843,11 @@ def send_alerts(alerts):
                        f"Usage: {usage_str} ({alert['percentage']:.1f}%)\n"
                        f"Policy: {alert.get('policy_info', 'default')}\n"
                        f"Enforcement: {alert.get('enforcement_mode', 'alert')}")
-            sns_client.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
+            sns_client.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Subject=subject,
+                Message=message,
+                MessageAttributes=_alert_message_attributes(alert),
+            )
         except Exception as e:
             print(f"Error sending alert for {alert['user']}: {e}")

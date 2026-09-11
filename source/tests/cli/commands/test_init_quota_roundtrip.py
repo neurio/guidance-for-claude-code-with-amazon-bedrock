@@ -50,6 +50,10 @@ def _make_profile() -> Profile:
         telemetry_db_egress_cidr="10.0.0.0/20",
         quota_write_mode="enforce",
         quota_db_min_row_ratio=0.75,
+        # Slack DM notifier: deploy-time only, deliberately not prompted for by
+        # the wizard. Values differ from the dataclass defaults so a reset shows.
+        slack_bot_token_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:slack-token-roFJNj",
+        slack_dm_allowlist="first@example.com,second@example.com",
     )
 
 
@@ -175,3 +179,71 @@ def test_full_save_then_rebuild_round_trip():
     result = saved["profile"]
     for attr in TELEMETRY_DB_ATTRS:
         assert getattr(result, attr) == getattr(original, attr), f"{attr} was lost in the save -> rebuild round trip"
+
+
+SLACK_ATTRS = ("slack_bot_token_secret_arn", "slack_dm_allowlist")
+
+
+def test_rerun_preserves_slack_notifier_fields():
+    """The wizard never prompts for the Slack fields, so it must not reset them.
+
+    `deploy.py` passes both to CloudFormation on every `ccwb deploy quota` and
+    `deploy_stack` does not use UsePreviousValue — so an empty
+    slack_bot_token_secret_arn deletes the notifier Lambda and its SNS
+    subscription. Adding these to `wizard_fields` without also restoring them in
+    `_check_existing_deployment` would silently turn Slack DMs off on the next
+    `ccwb init` re-run, which is how PRs #436 / #619 / #624 lost fields.
+    """
+    original = _make_profile()
+    saved: dict = {}
+    fake_config = Config()
+
+    with (
+        patch.object(Config, "load", return_value=fake_config),
+        # The real re-run path: an existing profile is loaded and mutated.
+        patch.object(fake_config, "get_profile", return_value=original),
+        patch.object(fake_config, "add_profile", side_effect=lambda p: saved.update(profile=p)),
+        patch.object(fake_config, "set_active_profile"),
+        patch.object(fake_config, "save"),
+    ):
+        InitCommand()._save_configuration(
+            {
+                "provider_domain": original.provider_domain,
+                "client_id": original.client_id,
+                "credential_storage": original.credential_storage,
+                "aws": {
+                    "region": original.aws_region,
+                    "identity_pool_name": original.identity_pool_name,
+                    "stacks": {},
+                    "allowed_bedrock_regions": ["us-east-1"],
+                },
+                "monitoring": {"enabled": True},
+                "quota": {},
+            },
+            original.name,
+        )
+
+    result = saved["profile"]
+    for attr in SLACK_ATTRS:
+        assert getattr(result, attr) == getattr(original, attr), f"{attr} was reset by an init re-run"
+
+
+def test_slack_fields_survive_a_profile_dict_round_trip():
+    """Profile.from_dict drops keys that are not declared dataclass fields, so a
+    to_dict -> from_dict cycle is what proves these are real fields."""
+    original = _make_profile()
+    reloaded = Profile.from_dict(original.to_dict())
+    for attr in SLACK_ATTRS:
+        assert getattr(reloaded, attr) == getattr(original, attr)
+
+
+def test_old_profiles_without_slack_fields_still_load():
+    """Backward compat: profile.json written before this feature must load."""
+    data = _make_profile().to_dict()
+    for attr in SLACK_ATTRS:
+        data.pop(attr, None)
+    reloaded = Profile.from_dict(data)
+    assert reloaded.slack_bot_token_secret_arn in (None, "")
+    # The default allowlist must still be non-empty only because it is a dev
+    # allowlist; what matters is that loading does not raise.
+    assert isinstance(reloaded.slack_dm_allowlist, str)

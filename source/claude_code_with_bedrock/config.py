@@ -130,6 +130,14 @@ class Profile:
     quota_write_mode: str = "shadow"
     quota_db_min_row_ratio: float = 0.5  # Refuse writes if the query returns < this fraction of known users
 
+    # Slack DM notifications for spend-budget alerts. Deploy-time only — these
+    # configure the quota_slack_notifier Lambda and are never read by the Go
+    # credential-process, so they intentionally have no config.go counterpart.
+    # Empty ARN disables the feature (no Lambda, no SNS subscription).
+    slack_bot_token_secret_arn: str | None = None  # Secrets Manager ARN for the Slack bot token
+    # Comma-separated recipients allowed a DM; empty blocks everyone (fails closed).
+    slack_dm_allowlist: str = "Cameron.Johnson@generac.com"
+
     # Monitoring endpoint (saved from deploy, avoids re-reading CloudFormation outputs)
     otel_collector_endpoint: str | None = None  # OTel collector ALB endpoint URL
 
