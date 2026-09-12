@@ -847,6 +847,15 @@ def _alert_message_attributes(alert):
     sidecar_monitor are excluded — they publish no attributes at all. It also
     means dropping "alert_type" here silently stops every Slack DM, so keep it.
 
+    alert_payload is Binary, NOT String, and that is load-bearing: SNS treats a
+    String attribute whose value is a JSON *object* as invalid while evaluating
+    a FilterPolicy and drops the entire message — alert_type included — counting
+    it under NumberOfNotificationsFilteredOut-InvalidAttributes. Publish still
+    succeeds and the monitor still logs "Sent N alerts", so the loss is visible
+    nowhere except that metric. Base64 sidesteps the JSON sniffing. A JSON array
+    would too (SNS reads it as String.Array), but only an object holds the
+    named fields the DM renders. See .claude/rules/sns-filter-policy-attributes.md.
+
     default=str on the payload dump is deliberate insurance: usage values are
     floats today, but a DynamoDB Decimal leaking in would otherwise raise
     inside the alert loop and lose the alert entirely.
@@ -856,7 +865,10 @@ def _alert_message_attributes(alert):
         "alert_type": {"DataType": "String", "StringValue": str(alert["alert_type"])},
         "alert_level": {"DataType": "String", "StringValue": str(alert["alert_level"])},
         "user_email": {"DataType": "String", "StringValue": str(alert["user"])},
-        "alert_payload": {"DataType": "String", "StringValue": json.dumps(alert, default=str)},
+        "alert_payload": {
+            "DataType": "Binary",
+            "BinaryValue": json.dumps(alert, default=str).encode("utf-8"),
+        },
     }
 
 

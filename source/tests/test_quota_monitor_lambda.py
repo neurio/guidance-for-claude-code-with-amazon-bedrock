@@ -20,6 +20,7 @@ Two regressions are pinned here:
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -869,13 +870,19 @@ class TestAlertMessageAttributes:
     """The SNS routing contract consumed by quota_slack_notifier.
 
     The Message body is free text for human email subscribers, so the machine
-    readable copy of each alert rides along as MessageAttributes. Two properties
-    matter and neither is visible in a normal deploy:
+    readable copy of each alert rides along as MessageAttributes. Three
+    properties matter and none is visible in a normal deploy:
 
     - `alert_type` must be present on every per-user alert. The Slack
       subscription's FilterPolicy names it, and an SNS FilterPolicy naming an
       attribute the message does NOT carry is a NON-match — dropping the
       attribute here would silence every DM with zero errors anywhere.
+    - No String attribute may hold a JSON object. SNS rejects the whole
+      attribute set as invalid mid-filter and drops the message, alert_type
+      included. This shipped once and silenced every DM for weeks: publish
+      returned success, the monitor logged "Sent N alerts", the notifier was
+      never invoked, and the only trace was the SNS
+      NumberOfNotificationsFilteredOut-InvalidAttributes metric.
     - Operator alerts must keep publishing NO attributes at all. That missing
       attribute non-match is the only thing stopping end users from being DM'd
       about a TimescaleDB safety-floor trip.
@@ -910,9 +917,43 @@ class TestAlertMessageAttributes:
             "alert_payload",
         }
         for name, spec in attrs.items():
+            if name == "alert_payload":
+                # Binary on purpose — see test_no_string_attribute_holds_json.
+                assert spec["DataType"] == "Binary", name
+                assert isinstance(spec["BinaryValue"], bytes) and spec["BinaryValue"], name
+                continue
             # SNS rejects an empty or non-string StringValue outright.
             assert spec["DataType"] == "String", name
             assert isinstance(spec["StringValue"], str) and spec["StringValue"], name
+
+    @pytest.mark.parametrize("alert_type", ["monthly_cost", "daily_cost", "monthly", "daily"])
+    def test_no_string_attribute_holds_json(self, base_env, alert_type):
+        """The regression guard for the bug that silenced every Slack DM.
+
+        A String attribute whose value parses as a JSON object (or array) makes
+        SNS abandon FilterPolicy evaluation for the entire message and count it
+        under NumberOfNotificationsFilteredOut-InvalidAttributes. Nothing
+        upstream errors, so only this assertion catches a reintroduction.
+        """
+        alert = dict(self.COST_ALERT, alert_type=alert_type)
+        _, kwargs = self._publish(base_env, alert)
+        for name, spec in kwargs["MessageAttributes"].items():
+            if spec.get("DataType") != "String":
+                continue
+            value = spec["StringValue"].lstrip()
+            assert not value.startswith(("{", "[")), (
+                f"{name} is a String attribute holding JSON; SNS will discard "
+                "the whole message mid-filter. Use DataType Binary instead."
+            )
+
+    def test_payload_survives_a_real_sns_binary_round_trip(self, base_env):
+        """Binary rides the Lambda envelope base64-encoded, so prove the
+        notifier's decode path gets the identical dict back."""
+        alert = dict(self.COST_ALERT, month="September 2026", days_remaining=20)
+        _, kwargs = self._publish(base_env, alert)
+        raw = kwargs["MessageAttributes"]["alert_payload"]["BinaryValue"]
+        envelope_value = base64.b64encode(raw).decode("ascii")
+        assert json.loads(base64.b64decode(envelope_value).decode("utf-8")) == alert
 
     def test_routing_attributes_carry_the_filterable_values(self, base_env):
         _, kwargs = self._publish(base_env, dict(self.COST_ALERT))
@@ -930,13 +971,15 @@ class TestAlertMessageAttributes:
     def test_payload_round_trips(self, base_env):
         alert = dict(self.COST_ALERT, month="September 2026", days_remaining=20)
         _, kwargs = self._publish(base_env, alert)
-        assert json.loads(kwargs["MessageAttributes"]["alert_payload"]["StringValue"]) == alert
+        raw = kwargs["MessageAttributes"]["alert_payload"]["BinaryValue"]
+        assert json.loads(raw.decode("utf-8")) == alert
 
     def test_decimal_usage_does_not_lose_the_alert(self, base_env):
         """DynamoDB hands back Decimal; a raw json.dumps would raise in-loop."""
         alert = dict(self.COST_ALERT, current_usage=Decimal("85.5"), limit=Decimal("100"))
         _, kwargs = self._publish(base_env, alert)
-        payload = json.loads(kwargs["MessageAttributes"]["alert_payload"]["StringValue"])
+        raw = kwargs["MessageAttributes"]["alert_payload"]["BinaryValue"]
+        payload = json.loads(raw.decode("utf-8"))
         assert payload["current_usage"] == "85.5"
 
     @pytest.mark.parametrize("alert_type", ["monthly", "daily"])

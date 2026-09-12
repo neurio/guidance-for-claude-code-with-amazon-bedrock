@@ -1,6 +1,7 @@
 # ABOUTME: Lambda that receives quota COST alerts from SNS and DMs the affected user on Slack
 # ABOUTME: The subscription FilterPolicy limits invocations to monthly_cost/daily_cost alerts
 
+import base64
 import json
 import os
 import time
@@ -87,10 +88,31 @@ def _attr(attrs, name):
     return ((attrs.get(name) or {}).get("Value") or "").strip()
 
 
+def _payload_attr(attrs):
+    """Recover the alert_payload JSON text.
+
+    quota_monitor publishes it as a Binary attribute because a String attribute
+    holding a JSON object makes SNS discard the whole message during FilterPolicy
+    evaluation (see that function's docstring). String is still accepted so a
+    message published by an older quota_monitor, or already in flight across a
+    stack update, still renders full figures instead of degrading to text.
+    """
+    spec = attrs.get("alert_payload") or {}
+    raw = (spec.get("Value") or "").strip()
+    if not raw or spec.get("Type") != "Binary":
+        return raw
+    try:
+        # binascii.Error and UnicodeDecodeError are both ValueError subclasses.
+        return base64.b64decode(raw, validate=True).decode("utf-8")
+    except ValueError:
+        print("WARNING: alert_payload was not decodable base64; falling back")
+        return ""
+
+
 def _alert_from_record(sns):
     """Recover the alert dict, most structured source first."""
     attrs = sns.get("MessageAttributes") or {}
-    payload = _attr(attrs, "alert_payload")
+    payload = _payload_attr(attrs)
     if payload:
         try:
             parsed = json.loads(payload)

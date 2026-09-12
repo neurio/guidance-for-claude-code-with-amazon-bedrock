@@ -20,6 +20,7 @@ so each one is pinned here:
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -96,7 +97,12 @@ def _cost_alert(**overrides):
 
 
 def _sns_event(alert=None, *, attributes=None, subject="", message=""):
-    """Build a Lambda SNS event. Note Type/Value — the Lambda envelope shape."""
+    """Build a Lambda SNS event. Note Type/Value — the Lambda envelope shape.
+
+    alert_payload is Binary/base64 because that is what quota_monitor publishes:
+    a String attribute holding a JSON object makes SNS discard the message
+    during FilterPolicy evaluation, so it can never reach this Lambda.
+    """
     if attributes is None:
         attributes = {}
         if alert is not None:
@@ -105,7 +111,10 @@ def _sns_event(alert=None, *, attributes=None, subject="", message=""):
                 "alert_type": {"Type": "String", "Value": alert["alert_type"]},
                 "alert_level": {"Type": "String", "Value": alert["alert_level"]},
                 "user_email": {"Type": "String", "Value": alert["user"]},
-                "alert_payload": {"Type": "String", "Value": json.dumps(alert)},
+                "alert_payload": {
+                    "Type": "Binary",
+                    "Value": base64.b64encode(json.dumps(alert).encode("utf-8")).decode("ascii"),
+                },
             }
     return {
         "Records": [
@@ -223,6 +232,31 @@ class TestSnsEnvelope:
         alert = _cost_alert()
         got = mod._alert_from_record(_sns_event(alert)["Records"][0]["Sns"])
         assert got == alert
+
+    def test_legacy_string_payload_still_parses(self):
+        """A message published by a quota_monitor from before the Binary switch,
+        or one already in flight across a stack update, must not degrade to the
+        text fallback and render a grid of "n/a"."""
+        mod = _load()
+        alert = _cost_alert()
+        attrs = {
+            "alert_type": {"Type": "String", "Value": alert["alert_type"]},
+            "alert_payload": {"Type": "String", "Value": json.dumps(alert)},
+        }
+        got = mod._alert_from_record(_sns_event(attributes=attrs)["Records"][0]["Sns"])
+        assert got == alert
+
+    def test_undecodable_binary_payload_degrades_to_flat_attributes(self):
+        mod = _load()
+        attrs = {
+            "alert_payload": {"Type": "Binary", "Value": "!!!not-base64!!!"},
+            "user_email": {"Type": "String", "Value": ALLOWED},
+            "alert_type": {"Type": "String", "Value": "monthly_cost"},
+            "alert_level": {"Type": "String", "Value": "warning"},
+        }
+        got = mod._alert_from_record(_sns_event(attributes=attrs)["Records"][0]["Sns"])
+        assert got["user"] == ALLOWED
+        assert got["alert_type"] == "monthly_cost"
 
     def test_reads_lambda_type_value_shape_not_publish_shape(self):
         mod = _load()
