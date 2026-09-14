@@ -221,15 +221,6 @@ Parameters:
       Required bot scopes: users:read, users:read.email, chat:write. Leave empty
       to disable Slack DM notifications entirely.
 
-  SlackDmAllowlist:
-    Type: String
-    Default: 'Cameron.Johnson@generac.com'
-    Description: >-
-      Comma-separated recipient emails allowed to receive a Slack DM. Compared
-      case-insensitively, since quota alerts carry the original OIDC email
-      casing. Any other recipient is logged and skipped without a Slack API
-      call. An EMPTY list blocks everyone — it does not mean "allow all".
-
   # A Slack bot can only see and DM users in the workspace it is installed in.
   # For a domain whose users live in a SEPARATE workspace, users.lookupByEmail
   # returns users_not_found, which looks exactly like "no Slack account" — so
@@ -698,7 +689,6 @@ Resources:
       Environment:
         Variables:
           SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
-          SLACK_DM_ALLOWLIST: !Ref SlackDmAllowlist
           SLACK_API_TIMEOUT_SECONDS: !Ref SlackApiTimeoutSeconds
           SLACK_DM_HELP_URL: !Ref SlackDmHelpUrl
           # Passed unconditionally: the Lambda ignores them unless BOTH are

@@ -35,14 +35,6 @@ SLACK_SECONDARY_DOMAINS = frozenset(
     if d.strip()
 )
 
-# Recipient allowlist. Compared case-insensitively: quota alerts carry the
-# original OIDC email casing on purpose (see .claude/rules/quota-usage-source.md),
-# so "Cameron.Johnson@..." and "cameron.johnson@..." are one person.
-# An EMPTY allowlist denies everyone — this fails closed by design.
-ALLOWLIST = frozenset(
-    e.strip().lower() for e in os.environ.get("SLACK_DM_ALLOWLIST", "").split(",") if e.strip()
-)
-
 SLACK_API_TIMEOUT = int(os.environ.get("SLACK_API_TIMEOUT_SECONDS", "5") or 5)
 SLACK_DM_HELP_URL = os.environ.get("SLACK_DM_HELP_URL", "")
 
@@ -76,12 +68,6 @@ def lambda_handler(event, context):
                 print("WARNING: alert carried no user email; skipping")
                 stats["skipped"] += 1
                 continue
-            if not _is_allowed(email):
-                # Dev allowlist. Checked before any Slack call or secret read, so
-                # a non-allowlisted address never leaves this account.
-                print(f"INFO: {email} not in SLACK_DM_ALLOWLIST; skipping Slack DM")
-                stats["skipped"] += 1
-                continue
             if _notify(alert, email):
                 stats["sent"] += 1
             else:
@@ -92,11 +78,6 @@ def lambda_handler(event, context):
             stats["failed"] += 1
     print(f"INFO: slack notifier {stats}")
     return stats
-
-
-def _is_allowed(email):
-    """Fail CLOSED: an empty allowlist denies everyone, it does not allow all."""
-    return email.strip().lower() in ALLOWLIST
 
 
 def _attr(attrs, name):

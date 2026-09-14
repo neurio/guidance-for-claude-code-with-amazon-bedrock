@@ -1,5 +1,5 @@
 # ABOUTME: Tests for the quota_slack_notifier Lambda that DMs users about spend budgets
-# ABOUTME: Pins the SNS envelope shape, the fail-closed allowlist, secret shapes, and template wiring
+# ABOUTME: Pins the SNS envelope shape, workspace routing, secret shapes, and template wiring
 
 """The Slack notifier has four failure modes that are silent by construction,
 so each one is pinned here:
@@ -11,9 +11,9 @@ so each one is pinned here:
 - An SNS FilterPolicy naming an attribute the message does not carry is a
   NON-match, so the template's FilterPolicy is the only thing keeping operator
   alerts away from end users — and the only thing letting cost alerts through.
-- The recipient allowlist must fail CLOSED: an empty list denies everyone. The
-  natural-looking ``if ALLOWLIST and email not in ALLOWLIST`` would invert that
-  and DM every user in the deployment.
+- There is deliberately NO recipient gate: every identity that crosses a
+  threshold is DM'd. Reintroducing one would silence alerts with nothing louder
+  than an INFO log per skipped user, so its absence is pinned.
 - The bot token secret is owned outside this repo, so both a bare token string
   and a JSON envelope must work, and no code path may log the value.
 """
@@ -48,12 +48,11 @@ def _load(env: dict | None = None):
 
     Config is read at module scope, so every env permutation needs its own
     module instance. os.environ is restored afterwards so later tests do not
-    inherit this allowlist.
+    inherit this configuration.
     """
     base = {
         "AWS_DEFAULT_REGION": "us-east-1",
         "SLACK_BOT_TOKEN_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:123456789012:secret:slack-AbCdEf",
-        "SLACK_DM_ALLOWLIST": ALLOWED,
         "SLACK_API_TIMEOUT_SECONDS": "5",
         "SLACK_DM_HELP_URL": "",
     }
@@ -203,32 +202,51 @@ class TestExtractToken:
         assert "xoxb-one" not in str(exc.value)
 
 
-class TestAllowlist:
-    """Must fail CLOSED and compare case-insensitively."""
+class TestNoRecipientGate:
+    """Every identity that crosses a threshold gets a DM — there is no allowlist.
 
-    def test_exact_match_allowed(self):
-        assert _load()._is_allowed(ALLOWED)
+    The recipient allowlist was a dev-only gate and was removed deliberately for
+    production, where all users must be alerted. These tests pin the *absence* of
+    a gate, because reintroducing one would silence alerts with nothing louder
+    than an INFO log per skipped user.
+    """
 
-    def test_lowercase_allowed(self):
-        # The load-bearing case: quota alerts carry the original OIDC casing,
-        # so a lowercase spelling of the same person must still match.
-        assert _load()._is_allowed("cameron.johnson@generac.com")
+    def test_no_allowlist_symbols_remain(self):
+        mod = _load()
+        assert not hasattr(mod, "_is_allowed"), "recipient gate was reintroduced"
+        assert not hasattr(mod, "ALLOWLIST"), "recipient gate was reintroduced"
 
-    def test_uppercase_and_padded_allowed(self):
-        assert _load()._is_allowed("  CAMERON.JOHNSON@GENERAC.COM  ")
+    def test_module_does_not_read_an_allowlist_env_var(self):
+        source = LAMBDA_PATH.read_text(encoding="utf-8")
+        assert "SLACK_DM_ALLOWLIST" not in source
 
-    def test_other_user_denied(self):
-        assert not _load()._is_allowed("someone.else@generac.com")
+    @pytest.mark.parametrize(
+        "email",
+        [
+            ALLOWED,
+            "cameron.johnson@generac.com",
+            "  CAMERON.JOHNSON@GENERAC.COM  ",
+            "someone.else@generac.com",
+            "kate.breedon@ecobee.com",
+            "brand.new.hire@generac.com",
+        ],
+    )
+    def test_every_recipient_is_delivered_to(self, email):
+        """Previously only ALLOWED survived; now all of these must be DM'd."""
+        mod = _load()
+        calls = _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP, "chat.postMessage": {"ok": True}})
+        stats = mod.lambda_handler(_sns_event(_cost_alert(user=email)), None)
+        assert stats == {"received": 1, "sent": 1, "skipped": 0, "failed": 0}
+        assert [c[0] for c in calls] == ["users.lookupByEmail", "chat.postMessage"]
 
-    def test_multi_entry_list_with_spaces(self):
-        mod = _load({"SLACK_DM_ALLOWLIST": f"{ALLOWED}, second@generac.com "})
-        assert mod._is_allowed("second@generac.com")
-        assert mod._is_allowed(ALLOWED)
-
-    def test_empty_allowlist_denies_everyone(self):
-        mod = _load({"SLACK_DM_ALLOWLIST": ""})
-        assert not mod._is_allowed(ALLOWED)
-        assert not mod._is_allowed("anyone@generac.com")
+    def test_alert_without_an_email_is_still_skipped(self):
+        """Removing the allowlist must not remove the empty-email guard: an
+        alert with no identity has nobody to DM and must not reach Slack."""
+        mod = _load()
+        calls = _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP})
+        stats = mod.lambda_handler(_sns_event(_cost_alert(user="")), None)
+        assert stats == {"received": 1, "sent": 0, "skipped": 1, "failed": 0}
+        assert calls == []
 
 
 class TestSnsEnvelope:
@@ -398,7 +416,7 @@ class TestDelivery:
         assert calls[0][2] is True and calls[1][2] is False
 
     def test_email_sent_to_slack_keeps_its_original_casing(self):
-        """The allowlist lowercases to COMPARE; it must not lowercase what is SENT.
+        """The cache key lowercases; what goes on the wire must not.
 
         `_lookup_by_email` is handed the address verbatim from the alert, which
         carries the raw OIDC `email` claim (e.g. "Cameron.Johnson@generac.com").
@@ -427,14 +445,6 @@ class TestDelivery:
         # the workspace that issued it, so the ARN has to be part of the key.
         assert {email for _arn, email in mod._user_id_cache} == {"cameron.johnson@generac.com"}
         assert len(mod._user_id_cache) == 1
-
-    def test_non_allowlisted_never_touches_slack_or_the_secret(self):
-        mod = _load()
-        calls = _stub_slack(mod, {})
-        stats = mod.lambda_handler(_sns_event(_cost_alert(user="other@generac.com")), None)
-        assert stats["skipped"] == 1 and stats["sent"] == 0
-        assert calls == []
-        mod.secrets_client.get_secret_value.assert_not_called()
 
     def test_missing_email_is_skipped(self):
         mod = _load()
@@ -583,14 +593,13 @@ class TestTemplateWiring:
         params = resolved["Parameters"]
         for name in (
             "SlackBotTokenSecretArn",
-            "SlackDmAllowlist",
             "SlackApiTimeoutSeconds",
             "SlackDmHelpUrl",
         ):
             assert name in params, f"{name} missing"
             assert "Default" in params[name], f"{name} needs a Default for existing stacks"
         assert params["SlackBotTokenSecretArn"]["Default"] == ""
-        assert params["SlackDmAllowlist"]["Default"] == "Cameron.Johnson@generac.com"
+        assert "SlackDmAllowlist" not in params, "the recipient allowlist was removed"
 
     def test_condition_gates_every_resource_and_the_output(self, resolved):
         assert "SlackNotifierEnabled" in resolved["Conditions"]
@@ -675,16 +684,16 @@ class TestTemplateWiring:
         env = resolved["Resources"]["QuotaSlackNotifierFunction"]["Properties"]["Environment"]["Variables"]
         for name in (
             "SLACK_BOT_TOKEN_SECRET_ARN",
-            "SLACK_DM_ALLOWLIST",
             "SLACK_API_TIMEOUT_SECONDS",
             "SLACK_DM_HELP_URL",
         ):
             assert f'"{name}"' in source, f"{name} not read by the Lambda"
             assert name in env, f"{name} not set by the template"
+        assert "SLACK_DM_ALLOWLIST" not in env, "the recipient allowlist was removed"
 
 
 class TestDeployWiring:
-    def test_deploy_passes_both_slack_parameters(self):
+    def test_deploy_passes_the_slack_parameters(self):
         """deploy_stack does not use UsePreviousValue, so a parameter absent
         from deploy.py's list is reset to its template default on every deploy —
         silently deleting the notifier and its subscription."""
@@ -692,7 +701,10 @@ class TestDeployWiring:
             Path(__file__).resolve().parents[1] / "claude_code_with_bedrock" / "cli" / "commands" / "deploy.py"
         ).read_text(encoding="utf-8")
         assert "SlackBotTokenSecretArn=" in source
-        assert "SlackDmAllowlist=" in source
+        assert "SlackSecondaryBotTokenSecretArn=" in source
+        assert "SlackSecondaryDomains=" in source
+        # Passing a parameter the template no longer declares fails the deploy.
+        assert "SlackDmAllowlist=" not in source
 
 
 SECONDARY_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:slack-ecobee-XyZ789"
@@ -702,7 +714,6 @@ EXTERNAL = "kate.breedon@ecobee.com"
 
 def _two_workspace_env(**overrides):
     env = {
-        "SLACK_DM_ALLOWLIST": f"{ALLOWED},{EXTERNAL}",
         "SLACK_SECONDARY_BOT_TOKEN_SECRET_ARN": SECONDARY_ARN,
         "SLACK_SECONDARY_DOMAINS": "ecobee.com",
     }
@@ -743,14 +754,14 @@ class TestSecondaryWorkspaceRouting:
 
     def test_unconfigured_secondary_falls_back_to_primary(self):
         """Default (both empty) must behave exactly as the single-workspace build."""
-        mod = _load({"SLACK_DM_ALLOWLIST": f"{ALLOWED},{EXTERNAL}"})
+        mod = _load()
         calls = _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP, "chat.postMessage": {"ok": True}})
         mod.lambda_handler(_sns_event(_cost_alert(user=EXTERNAL)), None)
         assert [c[3] for c in calls] == [PRIMARY_ARN, PRIMARY_ARN]
 
     def test_domains_without_a_token_do_not_route(self):
         """Half-configured must not silently point at an empty ARN."""
-        mod = _load({"SLACK_DM_ALLOWLIST": EXTERNAL, "SLACK_SECONDARY_DOMAINS": "ecobee.com"})
+        mod = _load({"SLACK_SECONDARY_DOMAINS": "ecobee.com"})
         assert mod._secret_arn_for_email(EXTERNAL) == PRIMARY_ARN
 
     def test_token_without_domains_does_not_route(self):
@@ -812,12 +823,11 @@ class TestSecondaryWorkspaceRouting:
         assert FAKE_TOKEN not in out
         assert "xox" not in out
 
-    def test_allowlist_still_gates_the_secondary_domain(self):
-        """Routing is not permission: an unlisted ecobee address is still skipped
-        before any Slack call or secret read."""
-        mod = _load(_two_workspace_env(SLACK_DM_ALLOWLIST=ALLOWED))
-        calls = _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP})
+    def test_secondary_domain_needs_no_opt_in(self):
+        """With the allowlist gone, an ecobee address is DM'd on sight — via the
+        secondary workspace's token, not the primary one."""
+        mod = _load(_two_workspace_env())
+        calls = _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP, "chat.postMessage": {"ok": True}})
         stats = mod.lambda_handler(_sns_event(_cost_alert(user=EXTERNAL)), None)
-        assert stats == {"received": 1, "sent": 0, "skipped": 1, "failed": 0}
-        assert calls == []
-        mod.secrets_client.get_secret_value.assert_not_called()
+        assert stats == {"received": 1, "sent": 1, "skipped": 0, "failed": 0}
+        assert [c[3] for c in calls] == [SECONDARY_ARN, SECONDARY_ARN]

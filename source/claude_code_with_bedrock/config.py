@@ -135,8 +135,6 @@ class Profile:
     # credential-process, so they intentionally have no config.go counterpart.
     # Empty ARN disables the feature (no Lambda, no SNS subscription).
     slack_bot_token_secret_arn: str | None = None  # Secrets Manager ARN for the Slack bot token
-    # Comma-separated recipients allowed a DM; empty blocks everyone (fails closed).
-    slack_dm_allowlist: str = "Cameron.Johnson@generac.com"
     # Optional second Slack workspace. A bot cannot see users outside the workspace
     # it is installed in, so domains whose people live elsewhere need their own
     # token. Both must be set for routing to apply; either empty = one workspace.

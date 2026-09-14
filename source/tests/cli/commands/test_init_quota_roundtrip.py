@@ -53,7 +53,6 @@ def _make_profile() -> Profile:
         # Slack DM notifier: deploy-time only, deliberately not prompted for by
         # the wizard. Values differ from the dataclass defaults so a reset shows.
         slack_bot_token_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:slack-token-roFJNj",
-        slack_dm_allowlist="first@example.com,second@example.com",
         # Second workspace. A bot cannot see users outside its own workspace,
         # so a domain living elsewhere needs its own token; both fields must
         # survive together or routing silently reverts to the primary bot.
@@ -188,7 +187,6 @@ def test_full_save_then_rebuild_round_trip():
 
 SLACK_ATTRS = (
     "slack_bot_token_secret_arn",
-    "slack_dm_allowlist",
     "slack_secondary_bot_token_secret_arn",
     "slack_secondary_domains",
 )
@@ -254,10 +252,20 @@ def test_old_profiles_without_slack_fields_still_load():
         data.pop(attr, None)
     reloaded = Profile.from_dict(data)
     assert reloaded.slack_bot_token_secret_arn in (None, "")
-    # The default allowlist must still be non-empty only because it is a dev
-    # allowlist; what matters is that loading does not raise.
-    assert isinstance(reloaded.slack_dm_allowlist, str)
     # Either secondary half empty means single-workspace routing, which is
     # exactly what a pre-feature profile should get.
     assert reloaded.slack_secondary_bot_token_secret_arn in (None, "")
     assert reloaded.slack_secondary_domains == ""
+
+
+def test_profiles_still_carrying_the_removed_allowlist_load():
+    """The recipient allowlist was removed from Profile, but every profile.json
+    already on disk still has the key. from_dict must drop it, not raise —
+    otherwise every existing deployment breaks on the next ccwb command.
+    """
+    data = _make_profile().to_dict()
+    data["slack_dm_allowlist"] = "someone@example.com,other@example.com"
+    reloaded = Profile.from_dict(data)
+    assert not hasattr(reloaded, "slack_dm_allowlist")
+    # The surviving Slack config must be untouched by the stale key.
+    assert reloaded.slack_secondary_domains == "ecobee.com"
