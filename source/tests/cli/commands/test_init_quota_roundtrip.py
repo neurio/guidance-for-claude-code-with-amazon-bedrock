@@ -54,6 +54,11 @@ def _make_profile() -> Profile:
         # the wizard. Values differ from the dataclass defaults so a reset shows.
         slack_bot_token_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:slack-token-roFJNj",
         slack_dm_allowlist="first@example.com,second@example.com",
+        # Second workspace. A bot cannot see users outside its own workspace,
+        # so a domain living elsewhere needs its own token; both fields must
+        # survive together or routing silently reverts to the primary bot.
+        slack_secondary_bot_token_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:slack-ecobee-XyZ789",
+        slack_secondary_domains="ecobee.com",
     )
 
 
@@ -181,7 +186,12 @@ def test_full_save_then_rebuild_round_trip():
         assert getattr(result, attr) == getattr(original, attr), f"{attr} was lost in the save -> rebuild round trip"
 
 
-SLACK_ATTRS = ("slack_bot_token_secret_arn", "slack_dm_allowlist")
+SLACK_ATTRS = (
+    "slack_bot_token_secret_arn",
+    "slack_dm_allowlist",
+    "slack_secondary_bot_token_secret_arn",
+    "slack_secondary_domains",
+)
 
 
 def test_rerun_preserves_slack_notifier_fields():
@@ -247,3 +257,7 @@ def test_old_profiles_without_slack_fields_still_load():
     # The default allowlist must still be non-empty only because it is a dev
     # allowlist; what matters is that loading does not raise.
     assert isinstance(reloaded.slack_dm_allowlist, str)
+    # Either secondary half empty means single-workspace routing, which is
+    # exactly what a pre-feature profile should get.
+    assert reloaded.slack_secondary_bot_token_secret_arn in (None, "")
+    assert reloaded.slack_secondary_domains == ""

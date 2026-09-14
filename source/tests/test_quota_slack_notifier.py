@@ -132,11 +132,16 @@ def _sns_event(alert=None, *, attributes=None, subject="", message=""):
 
 
 def _stub_slack(mod, responses):
-    """Replace _slack_call with a scripted stub. responses maps method -> body."""
+    """Replace _slack_call with a scripted stub. responses maps method -> body.
+
+    The 4th element of each recorded call is the secret ARN, i.e. which
+    workspace's token the call would have used. Defaulted so the many
+    single-workspace tests below read unchanged.
+    """
     calls = []
 
-    def fake(method, params, form):
-        calls.append((method, params, form))
+    def fake(method, params, form, secret_arn=None):
+        calls.append((method, params, form, secret_arn))
         body = responses.get(method, {"ok": True})
         if callable(body):
             body = body(len([c for c in calls if c[0] == method]))
@@ -418,7 +423,10 @@ class TestDelivery:
         stats = mod.lambda_handler(event, None)
         assert stats["sent"] == 2
         assert [c[0] for c in calls].count("users.lookupByEmail") == 1
-        assert set(mod._user_id_cache) == {"cameron.johnson@generac.com"}
+        # Keyed by (secret ARN, lowercased email): a Slack user ID is scoped to
+        # the workspace that issued it, so the ARN has to be part of the key.
+        assert {email for _arn, email in mod._user_id_cache} == {"cameron.johnson@generac.com"}
+        assert len(mod._user_id_cache) == 1
 
     def test_non_allowlisted_never_touches_slack_or_the_secret(self):
         mod = _load()
@@ -622,10 +630,40 @@ class TestTemplateWiring:
         ]
         assert len(statements) == 1
         assert statements[0]["Action"] == ["secretsmanager:GetSecretValue"]
-        # Must be the parameter, never a hand-built ARN (the random suffix is
-        # unguessable) — see .claude/rules/aws-identifiers.md.
-        assert statements[0]["Resource"] == {"Ref": "SlackBotTokenSecretArn"}
-        assert "*" not in json.dumps(statements[0]["Resource"])
+        # Must be the parameter(s), never a hand-built ARN (the random suffix is
+        # unguessable) — see .claude/rules/aws-identifiers.md. The second
+        # workspace's secret is granted ONLY when that feature is on, so a
+        # single-workspace stack keeps a one-resource grant.
+        assert statements[0]["Resource"] == {
+            "Fn::If": [
+                "SlackSecondaryWorkspaceEnabled",
+                [{"Ref": "SlackBotTokenSecretArn"}, {"Ref": "SlackSecondaryBotTokenSecretArn"}],
+                {"Ref": "SlackBotTokenSecretArn"},
+            ]
+        }
+
+    def test_secret_grant_has_no_wildcard_in_either_branch(self, intrinsics):
+        """A wildcard here would hand the function every secret in the account."""
+        statement = intrinsics["Resources"]["QuotaSlackNotifierRole"]["Properties"]["Policies"][0]["PolicyDocument"][
+            "Statement"
+        ][0]
+        assert "*" not in json.dumps(statement["Resource"])
+
+    def test_secondary_workspace_needs_both_halves(self, intrinsics):
+        """A token with no domains is dead config; domains with no token silently
+        fall back to the primary workspace. Require both, so neither half can be
+        set alone and look like it is working."""
+        condition = intrinsics["Conditions"]["SlackSecondaryWorkspaceEnabled"]
+        rendered = json.dumps(condition)
+        assert "Fn::And" in rendered
+        assert "SlackSecondaryBotTokenSecretArn" in rendered
+        assert "SlackSecondaryDomains" in rendered
+
+    def test_secondary_params_default_to_off(self, resolved):
+        """Existing stacks must update without turning anything on."""
+        params = resolved["Parameters"]
+        assert params["SlackSecondaryBotTokenSecretArn"]["Default"] == ""
+        assert params["SlackSecondaryDomains"]["Default"] == ""
 
     def test_function_is_not_vpc_attached(self, resolved):
         props = resolved["Resources"]["QuotaSlackNotifierFunction"]["Properties"]
@@ -655,3 +693,131 @@ class TestDeployWiring:
         ).read_text(encoding="utf-8")
         assert "SlackBotTokenSecretArn=" in source
         assert "SlackDmAllowlist=" in source
+
+
+SECONDARY_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:slack-ecobee-XyZ789"
+PRIMARY_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:slack-AbCdEf"
+EXTERNAL = "kate.breedon@ecobee.com"
+
+
+def _two_workspace_env(**overrides):
+    env = {
+        "SLACK_DM_ALLOWLIST": f"{ALLOWED},{EXTERNAL}",
+        "SLACK_SECONDARY_BOT_TOKEN_SECRET_ARN": SECONDARY_ARN,
+        "SLACK_SECONDARY_DOMAINS": "ecobee.com",
+    }
+    env.update(overrides)
+    return env
+
+
+class TestSecondaryWorkspaceRouting:
+    """A Slack bot can only see users in its own workspace.
+
+    users.lookupByEmail returned `users_not_found` for kate.breedon@ecobee.com
+    against the generac workspace bot — verified live. That error is
+    indistinguishable from "has no Slack account", so a domain living in another
+    workspace must be routed to a token installed THERE. 167 of 395 identities in
+    the quota table are on that domain, so this is the majority-of-users path,
+    not an edge case.
+    """
+
+    def test_secondary_domain_uses_the_secondary_token(self):
+        mod = _load(_two_workspace_env())
+        calls = _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP, "chat.postMessage": {"ok": True}})
+        mod.lambda_handler(_sns_event(_cost_alert(user=EXTERNAL)), None)
+        assert [c[3] for c in calls] == [SECONDARY_ARN, SECONDARY_ARN]
+
+    def test_primary_domain_is_unaffected_by_the_second_workspace(self):
+        """Adding a workspace must not change delivery for the existing one."""
+        mod = _load(_two_workspace_env())
+        calls = _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP, "chat.postMessage": {"ok": True}})
+        mod.lambda_handler(_sns_event(_cost_alert(user=ALLOWED)), None)
+        assert [c[3] for c in calls] == [PRIMARY_ARN, PRIMARY_ARN]
+
+    def test_lookup_and_post_share_one_workspace(self):
+        """A user ID from one workspace is meaningless in another."""
+        mod = _load(_two_workspace_env())
+        calls = _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP, "chat.postMessage": {"ok": True}})
+        mod.lambda_handler(_sns_event(_cost_alert(user=EXTERNAL)), None)
+        assert len({c[3] for c in calls}) == 1
+
+    def test_unconfigured_secondary_falls_back_to_primary(self):
+        """Default (both empty) must behave exactly as the single-workspace build."""
+        mod = _load({"SLACK_DM_ALLOWLIST": f"{ALLOWED},{EXTERNAL}"})
+        calls = _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP, "chat.postMessage": {"ok": True}})
+        mod.lambda_handler(_sns_event(_cost_alert(user=EXTERNAL)), None)
+        assert [c[3] for c in calls] == [PRIMARY_ARN, PRIMARY_ARN]
+
+    def test_domains_without_a_token_do_not_route(self):
+        """Half-configured must not silently point at an empty ARN."""
+        mod = _load({"SLACK_DM_ALLOWLIST": EXTERNAL, "SLACK_SECONDARY_DOMAINS": "ecobee.com"})
+        assert mod._secret_arn_for_email(EXTERNAL) == PRIMARY_ARN
+
+    def test_token_without_domains_does_not_route(self):
+        mod = _load({"SLACK_SECONDARY_BOT_TOKEN_SECRET_ARN": SECONDARY_ARN})
+        assert mod._secret_arn_for_email(EXTERNAL) == PRIMARY_ARN
+
+    def test_domain_matching_is_case_insensitive_and_padded_tolerant(self):
+        mod = _load(_two_workspace_env(SLACK_SECONDARY_DOMAINS=" ECOBEE.COM , @other.com "))
+        assert mod._secret_arn_for_email("Kate.Breedon@EcoBee.CoM") == SECONDARY_ARN
+        assert mod._secret_arn_for_email("someone@other.com") == SECONDARY_ARN
+        assert mod._secret_arn_for_email(ALLOWED) == PRIMARY_ARN
+
+    def test_subdomain_is_not_treated_as_a_match(self):
+        """Exact domain only — evil-ecobee.com must not borrow the token."""
+        mod = _load(_two_workspace_env())
+        assert mod._secret_arn_for_email("x@evil-ecobee.com") == PRIMARY_ARN
+        assert mod._secret_arn_for_email("x@sub.ecobee.com") == PRIMARY_ARN
+
+    def test_malformed_address_falls_back_to_primary(self):
+        mod = _load(_two_workspace_env())
+        assert mod._secret_arn_for_email("no-at-sign") == PRIMARY_ARN
+
+    def test_each_workspace_token_is_fetched_and_cached_separately(self):
+        mod = _load(_two_workspace_env())
+        _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP, "chat.postMessage": {"ok": True}})
+        assert mod._slack_token(PRIMARY_ARN) == FAKE_TOKEN
+        assert mod._slack_token(SECONDARY_ARN) == FAKE_TOKEN
+        assert set(mod._slack_token_cache) == {PRIMARY_ARN, SECONDARY_ARN}
+        # Two distinct secrets => two reads, then cached.
+        assert mod.secrets_client.get_secret_value.call_count == 2
+        mod._slack_token(PRIMARY_ARN)
+        assert mod.secrets_client.get_secret_value.call_count == 2
+
+    def test_same_email_in_two_workspaces_is_two_cache_entries(self):
+        """The cache key must include the workspace or a stale ID gets reused."""
+        mod = _load(_two_workspace_env())
+        _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP, "chat.postMessage": {"ok": True}})
+        mod._lookup_user_id(ALLOWED, PRIMARY_ARN)
+        mod._lookup_user_id(ALLOWED, SECONDARY_ARN)
+        assert len(mod._user_id_cache) == 2
+        assert (PRIMARY_ARN, ALLOWED.lower()) in mod._user_id_cache
+        assert (SECONDARY_ARN, ALLOWED.lower()) in mod._user_id_cache
+
+    def test_users_not_found_names_the_workspace_searched(self, capsys):
+        """Without this, a missing SLACK_SECONDARY_DOMAINS entry is unfixable from
+        the logs — it looks identical to the user having no Slack account."""
+        mod = _load(_two_workspace_env())
+        _stub_slack(mod, {"users.lookupByEmail": {"ok": False, "error": "users_not_found"}})
+        mod.lambda_handler(_sns_event(_cost_alert(user=EXTERNAL)), None)
+        out = capsys.readouterr().out
+        assert "users_not_found" in out
+        assert "secondary workspace" in out
+
+    def test_neither_workspace_arn_is_ever_logged_with_a_token(self, capsys):
+        mod = _load(_two_workspace_env())
+        _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP, "chat.postMessage": {"ok": True}})
+        mod.lambda_handler(_sns_event(_cost_alert(user=EXTERNAL)), None)
+        out = capsys.readouterr().out
+        assert FAKE_TOKEN not in out
+        assert "xox" not in out
+
+    def test_allowlist_still_gates_the_secondary_domain(self):
+        """Routing is not permission: an unlisted ecobee address is still skipped
+        before any Slack call or secret read."""
+        mod = _load(_two_workspace_env(SLACK_DM_ALLOWLIST=ALLOWED))
+        calls = _stub_slack(mod, {"users.lookupByEmail": _OK_LOOKUP})
+        stats = mod.lambda_handler(_sns_event(_cost_alert(user=EXTERNAL)), None)
+        assert stats == {"received": 1, "sent": 0, "skipped": 1, "failed": 0}
+        assert calls == []
+        mod.secrets_client.get_secret_value.assert_not_called()

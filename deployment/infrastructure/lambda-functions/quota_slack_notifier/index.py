@@ -17,6 +17,24 @@ secrets_client = boto3.client("secretsmanager")
 # Configuration from environment
 SLACK_BOT_TOKEN_SECRET_ARN = os.environ.get("SLACK_BOT_TOKEN_SECRET_ARN", "")
 
+# Optional SECOND Slack workspace, selected by the email's domain.
+#
+# A bot can only see and DM users in the workspace it is installed in. There is
+# no cross-workspace lookup: users.lookupByEmail returns `users_not_found` for
+# an address in another workspace, which is indistinguishable from "this person
+# has no Slack account at all". Cross-org DMs additionally require an accepted
+# Slack Connect invite per user, so they cannot be automated.
+#
+# So a domain whose people live in a different workspace needs its own Slack app
+# and its own token. Empty ARN or empty domain list = single-workspace behaviour,
+# byte-identical to before.
+SLACK_SECONDARY_BOT_TOKEN_SECRET_ARN = os.environ.get("SLACK_SECONDARY_BOT_TOKEN_SECRET_ARN", "")
+SLACK_SECONDARY_DOMAINS = frozenset(
+    d.strip().lower().lstrip("@")
+    for d in os.environ.get("SLACK_SECONDARY_DOMAINS", "").split(",")
+    if d.strip()
+)
+
 # Recipient allowlist. Compared case-insensitively: quota alerts carry the
 # original OIDC email casing on purpose (see .claude/rules/quota-usage-source.md),
 # so "Cameron.Johnson@..." and "cameron.johnson@..." are one person.
@@ -31,8 +49,11 @@ SLACK_DM_HELP_URL = os.environ.get("SLACK_DM_HELP_URL", "")
 # Bound the 429 backoff so one rate-limited call cannot consume the whole timeout
 SLACK_MAX_RETRY_SLEEP = 20
 
-_slack_token_cache = None
-_user_id_cache = {}  # email (lowercased) -> Slack user ID; warm-container only
+_slack_token_cache = {}  # secret ARN -> bot token; NEVER logged
+# (secret ARN, lowercased email) -> Slack user ID; warm-container only.
+# The ARN is part of the key because a Slack user ID is scoped to its workspace:
+# the same address in two workspaces is two different IDs.
+_user_id_cache = {}
 
 
 def lambda_handler(event, context):
@@ -161,15 +182,34 @@ _TOKEN_KEYS = (
 )
 
 
-def _slack_token():
-    """Fetch and cache the Slack bot token. NEVER logged."""
-    global _slack_token_cache
-    if _slack_token_cache is None:
-        if not SLACK_BOT_TOKEN_SECRET_ARN:
-            raise RuntimeError("SLACK_BOT_TOKEN_SECRET_ARN is not configured")
-        raw = secrets_client.get_secret_value(SecretId=SLACK_BOT_TOKEN_SECRET_ARN)["SecretString"]
-        _slack_token_cache = _extract_token(raw)
-    return _slack_token_cache
+def _secret_arn_for_email(email):
+    """Which workspace's bot token can see this address.
+
+    The domain decides, because workspace membership does. Anything not listed in
+    SLACK_SECONDARY_DOMAINS falls through to the primary token, so adding a
+    second workspace cannot change delivery for the existing one.
+    """
+    domain = email.rsplit("@", 1)[-1].strip().lower() if "@" in email else ""
+    if domain and domain in SLACK_SECONDARY_DOMAINS and SLACK_SECONDARY_BOT_TOKEN_SECRET_ARN:
+        return SLACK_SECONDARY_BOT_TOKEN_SECRET_ARN
+    return SLACK_BOT_TOKEN_SECRET_ARN
+
+
+def _workspace_label(secret_arn):
+    """A log-safe name for a workspace. Never include the ARN or the token."""
+    if secret_arn and secret_arn == SLACK_SECONDARY_BOT_TOKEN_SECRET_ARN:
+        return "secondary"
+    return "primary"
+
+
+def _slack_token(secret_arn):
+    """Fetch and cache one workspace's bot token. NEVER logged."""
+    if not secret_arn:
+        raise RuntimeError("SLACK_BOT_TOKEN_SECRET_ARN is not configured")
+    if secret_arn not in _slack_token_cache:
+        raw = secrets_client.get_secret_value(SecretId=secret_arn)["SecretString"]
+        _slack_token_cache[secret_arn] = _extract_token(raw)
+    return _slack_token_cache[secret_arn]
 
 
 def _extract_token(raw):
@@ -204,8 +244,8 @@ def _extract_token(raw):
     )
 
 
-def _slack_call(method, params, form):
-    """POST to slack.com/api/<method>.
+def _slack_call(method, params, form, secret_arn=None):
+    """POST to slack.com/api/<method> using one workspace's token.
 
     form=True (urlencoded) for users.lookupByEmail — that method does not accept
     a JSON body. form=False (JSON) for chat.postMessage, which needs it for
@@ -227,7 +267,7 @@ def _slack_call(method, params, form):
         data=body,
         method="POST",
         headers={
-            "Authorization": f"Bearer {_slack_token()}",
+            "Authorization": f"Bearer {_slack_token(secret_arn or SLACK_BOT_TOKEN_SECRET_ARN)}",
             "Content-Type": content_type,
         },
     )
@@ -248,35 +288,47 @@ def _slack_call(method, params, form):
         return parsed, retry_after
 
 
-def _slack_call_with_retry(method, params, form):
+def _slack_call_with_retry(method, params, form, secret_arn=None):
     """One bounded retry on `ratelimited`. Any other error is returned as-is."""
-    body, retry_after = _slack_call(method, params, form)
+    body, retry_after = _slack_call(method, params, form, secret_arn)
     if body.get("ok") or body.get("error") != "ratelimited":
         return body
     delay = min(retry_after or 1, SLACK_MAX_RETRY_SLEEP)
     print(f"WARNING: {method} ratelimited; retrying in {delay}s")
     time.sleep(delay)
-    body, _ = _slack_call(method, params, form)
+    body, _ = _slack_call(method, params, form, secret_arn)
     return body
 
 
-def _lookup_user_id(email):
+def _lookup_user_id(email, secret_arn):
     """Resolve an email to a Slack user ID. Needs users:read.email + users:read.
 
     Cached per warm container: users.lookupByEmail is a Tier 3 method
     (~50 req/min) and the same handful of identities re-alert across a month.
     """
-    key = email.strip().lower()
+    key = (secret_arn, email.strip().lower())
     if key in _user_id_cache:
         return _user_id_cache[key]
-    body = _slack_call_with_retry("users.lookupByEmail", {"email": email}, True)
+    body = _slack_call_with_retry("users.lookupByEmail", {"email": email}, True, secret_arn)
     if not body.get("ok"):
         error = body.get("error", "unknown")
         if error == "users_not_found":
             # Expected, not a fault: an AWS/OIDC identity with no Slack account,
-            # or a Slack profile using a different primary email.
-            print(f"WARNING: no Slack user for {email} (users_not_found)")
-        elif error in ("missing_scope", "invalid_auth", "account_inactive", "token_revoked", "not_authed"):
+            # or a Slack profile using a different primary email. It is ALSO what
+            # an address in a different workspace looks like, so name the
+            # workspace we searched — otherwise the two are indistinguishable and
+            # a missing SLACK_SECONDARY_DOMAINS entry reads as "no Slack account".
+            print(
+                f"WARNING: no Slack user for {email} in the "
+                f"{_workspace_label(secret_arn)} workspace (users_not_found)"
+            )
+        elif error in (
+            "missing_scope",
+            "invalid_auth",
+            "account_inactive",
+            "token_revoked",
+            "not_authed",
+        ):
             print(
                 f"ERROR: Slack auth/scope problem on users.lookupByEmail: {error} "
                 f"(needed={body.get('needed')})"
@@ -291,8 +343,14 @@ def _lookup_user_id(email):
 
 
 def _notify(alert, email):
-    """Resolve the user and DM them. Returns True only on a delivered message."""
-    user_id = _lookup_user_id(email)
+    """Resolve the user and DM them. Returns True only on a delivered message.
+
+    Both calls must use the SAME workspace token: the user ID returned by one
+    workspace is meaningless to another, and posting to it would fail with
+    channel_not_found at best.
+    """
+    secret_arn = _secret_arn_for_email(email)
+    user_id = _lookup_user_id(email, secret_arn)
     if not user_id:
         return False
     text, blocks = _build_message(alert)
@@ -306,6 +364,7 @@ def _notify(alert, email):
             "unfurl_media": False,
         },
         False,
+        secret_arn,
     )
     if body.get("ok"):
         print(
@@ -320,7 +379,9 @@ def _notify(alert, email):
             f"WARNING: invalid_blocks for {email}; retrying as plain text: "
             f"{body.get('response_metadata')}"
         )
-        body = _slack_call_with_retry("chat.postMessage", {"channel": user_id, "text": text}, False)
+        body = _slack_call_with_retry(
+            "chat.postMessage", {"channel": user_id, "text": text}, False, secret_arn
+        )
         if body.get("ok"):
             return True
         error = body.get("error", "unknown")

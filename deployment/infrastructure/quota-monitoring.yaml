@@ -230,6 +230,29 @@ Parameters:
       casing. Any other recipient is logged and skipped without a Slack API
       call. An EMPTY list blocks everyone — it does not mean "allow all".
 
+  # A Slack bot can only see and DM users in the workspace it is installed in.
+  # For a domain whose users live in a SEPARATE workspace, users.lookupByEmail
+  # returns users_not_found, which looks exactly like "no Slack account" — so
+  # those domains need their own app and token. Both params must be set for the
+  # routing to take effect; either one empty keeps single-workspace behaviour.
+  SlackSecondaryBotTokenSecretArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. Full ARN of the Secrets Manager secret holding a SECOND Slack
+      workspace's bot token, including the random suffix. Same accepted shapes
+      and same required scopes as SlackBotTokenSecretArn. Used only for the
+      domains listed in SlackSecondaryDomains. Leave empty for one workspace.
+
+  SlackSecondaryDomains:
+    Type: String
+    Default: ''
+    Description: >-
+      Comma-separated email domains routed to SlackSecondaryBotTokenSecretArn
+      (e.g. "ecobee.com"). Compared case-insensitively on the part after the @.
+      Any domain not listed uses the primary token, so adding a second workspace
+      cannot change delivery for the first.
+
   SlackApiTimeoutSeconds:
     Type: Number
     Default: 5
@@ -251,6 +274,11 @@ Conditions:
   HasTelemetryDb: !Not [!Equals [!Ref TelemetryDbSecretArn, '']]
   HasTelemetryDbEgressCidr: !Not [!Equals [!Ref TelemetryDbEgressCidr, '']]
   SlackNotifierEnabled: !Not [!Equals [!Ref SlackBotTokenSecretArn, '']]
+  # Both halves required: a token with no domains routed to it would never be
+  # used, and domains with no token silently fall back to the primary workspace.
+  SlackSecondaryWorkspaceEnabled: !And
+    - !Not [!Equals [!Ref SlackSecondaryBotTokenSecretArn, '']]
+    - !Not [!Equals [!Ref SlackSecondaryDomains, '']]
 
 Resources:
   # DynamoDB table for quota policies (user, group, default levels)
@@ -628,11 +656,17 @@ Resources:
               # The only non-logging AWS call this function makes. No
               # placeholder-ARN !If is needed here (unlike QuotaMonitorRole
               # above): the whole role is conditional on the ARN being
-              # non-empty, so Resource can never be an empty string.
+              # non-empty, so Resource can never be an empty string. The second
+              # workspace's secret is added only when that feature is on, so a
+              # single-workspace deployment grants exactly one resource.
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Ref SlackBotTokenSecretArn
+                Resource: !If
+                  - SlackSecondaryWorkspaceEnabled
+                  - - !Ref SlackBotTokenSecretArn
+                    - !Ref SlackSecondaryBotTokenSecretArn
+                  - !Ref SlackBotTokenSecretArn
 
   QuotaSlackNotifierFunction:
     Type: AWS::Lambda::Function
@@ -667,6 +701,10 @@ Resources:
           SLACK_DM_ALLOWLIST: !Ref SlackDmAllowlist
           SLACK_API_TIMEOUT_SECONDS: !Ref SlackApiTimeoutSeconds
           SLACK_DM_HELP_URL: !Ref SlackDmHelpUrl
+          # Passed unconditionally: the Lambda ignores them unless BOTH are
+          # non-empty, and gating them here would drop the pair out of sync.
+          SLACK_SECONDARY_BOT_TOKEN_SECRET_ARN: !Ref SlackSecondaryBotTokenSecretArn
+          SLACK_SECONDARY_DOMAINS: !Ref SlackSecondaryDomains
       Code: ./lambda-functions/quota_slack_notifier/
 
   QuotaSlackNotifierPermission:

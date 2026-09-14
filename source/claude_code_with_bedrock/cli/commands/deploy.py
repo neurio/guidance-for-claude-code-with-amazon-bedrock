@@ -1385,6 +1385,8 @@ class DeployCommand(Command):
                     # which would silently delete the notifier and subscription.
                     f"SlackBotTokenSecretArn={getattr(profile, 'slack_bot_token_secret_arn', None) or ''}",
                     f"SlackDmAllowlist={getattr(profile, 'slack_dm_allowlist', None) or ''}",
+                    f"SlackSecondaryBotTokenSecretArn={getattr(profile, 'slack_secondary_bot_token_secret_arn', None) or ''}",
+                    f"SlackSecondaryDomains={getattr(profile, 'slack_secondary_domains', None) or ''}",
                 ]
 
                 if not telemetry_db_secret_arn:
