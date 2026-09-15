@@ -88,6 +88,20 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
+          # Explicit Deny wins over every Allow below regardless of statement
+          # order. Denying the foundation-model ARNs is what makes this airtight:
+          # invoking through any inference profile (us./global./application)
+          # also requires permission on the underlying foundation model, so
+          # application inference profiles are covered even though their opaque
+          # IDs cannot be name-matched. 'bedrock:*' rather than an action list
+          # so a future invoke action cannot leak around it.
+          - Sid: DenyClaudeFableModels
+            Effect: Deny
+            Action: 'bedrock:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*anthropic.claude-fable*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:::foundation-model/*anthropic.claude-fable*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*anthropic.claude-fable*'
           - Sid: AllowBedrockInvokeRegional
             Effect: Allow
             Action:
