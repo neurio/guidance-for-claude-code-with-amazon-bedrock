@@ -95,13 +95,16 @@ Resources:
           # application inference profiles are covered even though their opaque
           # IDs cannot be name-matched. 'bedrock:*' rather than an action list
           # so a future invoke action cannot leak around it.
+          # Scoped to the exact 'claude-fable-5' suffix rather than a trailing
+          # wildcard: this denies Fable 5 only, and a new Fable release (e.g.
+          # claude-fable-5-1) needs its own ARN added here to be denied.
           - Sid: DenyClaudeFableModels
             Effect: Deny
             Action: 'bedrock:*'
             Resource:
-              - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*anthropic.claude-fable*'
-              - !Sub 'arn:${AWS::Partition}:bedrock:::foundation-model/*anthropic.claude-fable*'
-              - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*anthropic.claude-fable*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*anthropic.claude-fable-5'
+              - !Sub 'arn:${AWS::Partition}:bedrock:::foundation-model/*anthropic.claude-fable-5'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*anthropic.claude-fable-5'
           - Sid: AllowBedrockInvokeRegional
             Effect: Allow
             Action:
