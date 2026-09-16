@@ -96,8 +96,8 @@ Resources:
           # IDs cannot be name-matched. 'bedrock:*' rather than an action list
           # so a future invoke action cannot leak around it.
           # Scoped to the exact 'claude-fable-5' suffix rather than a trailing
-          # wildcard: this denies Fable 5 only, and a new Fable release (e.g.
-          # claude-fable-5-1) needs its own ARN added here to be denied.
+          # wildcard: this denies Fable 5 only, and a new Fable release needs its
+          # own statement (see DenyClaudeFable51ExceptAllowlist below for 5.1).
           - Sid: DenyClaudeFableModels
             Effect: Deny
             Action: 'bedrock:*'
@@ -105,6 +105,46 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*anthropic.claude-fable-5'
               - !Sub 'arn:${AWS::Partition}:bedrock:::foundation-model/*anthropic.claude-fable-5'
               - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*anthropic.claude-fable-5'
+          # Fable 5.1 is allow-listed rather than denied outright: this Deny fires
+          # for every principal whose aws:userid is NOT in the list below. Same ARN
+          # and 'bedrock:*' reasoning as DenyClaudeFableModels above.
+          #
+          # aws:userid for a web-identity session is '<role-unique-id>:<RoleSessionName>',
+          # and credential-process sets RoleSessionName to the raw 'email' claim
+          # (buildSessionName in source/go/internal/federation/sts.go). The leading
+          # '*' stands in for the role's unique ID, which cannot be referenced here:
+          # DirectIAMRole attaches this managed policy, so !GetAtt DirectIAMRole.RoleId
+          # would be a circular dependency.
+          #
+          # TO GRANT A USER FABLE 5.1:
+          #   add '*:<their session name>' below. Do NOT type the email from
+          #   memory — StringNotLike is case-SENSITIVE (IAM has no
+          #   StringNotLikeIgnoreCase) and Azure AD spells the claim with
+          #   capitals, e.g. 'Cameron.Johnson@generac.com'. Characters outside
+          #   [\w+=,.@-] also become '-' and the name is truncated to 64 chars.
+          #   Have them run this and paste the part after the ':' —
+          #     aws sts get-caller-identity --profile ClaudeCode --query UserId
+          #
+          # Removing every entry denies Fable 5.1 to everyone (fails closed).
+          #
+          # FederationType=cognito note: there, aws:userid is '<role-id>:<cognito
+          # identity id>', not an email, so no entry can match and Fable 5.1 is
+          # denied outright. To allow-list under cognito, match the session tag
+          # the identity pool already maps instead (IdentityPoolPrincipalTag sets
+          # UserEmail from the 'email' claim):
+          #   StringNotEqualsIgnoreCase:
+          #     'aws:PrincipalTag/UserEmail': ['<their email>']
+          - Sid: DenyClaudeFable51ExceptAllowlist
+            Effect: Deny
+            Action: 'bedrock:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*anthropic.claude-fable-5-1'
+              - !Sub 'arn:${AWS::Partition}:bedrock:::foundation-model/*anthropic.claude-fable-5-1'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*anthropic.claude-fable-5-1'
+            Condition:
+              StringNotLike:
+                'aws:userid':
+                  - '*:Cameron.Johnson@generac.com'
           - Sid: AllowBedrockInvokeRegional
             Effect: Allow
             Action:
