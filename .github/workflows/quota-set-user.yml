@@ -1,0 +1,119 @@
+name: Quota - Set User Budget
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_email:
+        description: "Generac email of the user to update"
+        required: true
+        type: string
+      monthly_limit:
+        description: "Monthly token limit (0 disables token-count enforcement)"
+        required: true
+        type: string
+        default: "0"
+      budget:
+        description: "Month-to-date cost budget in USD"
+        required: true
+        type: string
+      enforcement:
+        description: "Enforcement mode"
+        required: true
+        type: choice
+        options:
+          - block
+          - alert
+        default: block
+      expires_month_end:
+        description: "Expire this override at the end of the current month"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  set-user-quota:
+    runs-on: ubuntu-latest
+    environment: quota-admin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::626747813953:role/ccwb-quota-admin-oidc-role-neurio
+          aws-region: us-east-1
+
+      - name: Fetch ccwb profile
+        run: |
+          mkdir -p ~/.ccwb/profiles
+          aws secretsmanager get-secret-value \
+            --secret-id dev/ccwb/et-ai-dev-us-east-1-profile \
+            --query SecretString --output text > ~/.ccwb/profiles/et-ai-dev-us-east-1.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Configure Poetry
+        run: poetry config virtualenvs.in-project true
+
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v6
+        with:
+          path: source/.venv
+          key: ${{ runner.os }}-poetry-3.12-${{ hashFiles('source/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-3.12-
+
+      - name: Install poetry deps
+        working-directory: source
+        run: poetry install --no-interaction
+
+      - name: Apply quota policy
+        id: apply
+        working-directory: source
+        run: |
+          EXPIRES_FLAG=""
+          if [ "${{ inputs.expires_month_end }}" = "true" ]; then
+            EXPIRES_FLAG="--expires-month-end"
+          fi
+          OUTPUT=$(poetry run ccwb quota set-user "${{ inputs.user_email }}" \
+            --monthly-limit "${{ inputs.monthly_limit }}" \
+            --budget "${{ inputs.budget }}" \
+            $EXPIRES_FLAG \
+            --profile et-ai-dev-us-east-1 \
+            --enforcement "${{ inputs.enforcement }}" 2>&1)
+          EXIT_CODE=$?
+          echo "$OUTPUT"
+          echo "output<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          exit $EXIT_CODE
+
+      - name: Record attribution
+        if: always()
+        run: |
+          {
+            echo "### Quota update"
+            echo "- **Requested by:** \`${{ github.actor }}\`"
+            echo "- **Target user:** \`${{ inputs.user_email }}\`"
+            echo "- **Monthly limit:** \`${{ inputs.monthly_limit }}\`"
+            echo "- **Budget:** \`${{ inputs.budget }}\`"
+            echo "- **Enforcement:** \`${{ inputs.enforcement }}\`"
+            echo "- **Expires month end:** \`${{ inputs.expires_month_end }}\`"
+            echo "- **Result:** \`${{ steps.apply.outcome }}\`"
+            echo ""
+            echo "**CLI output:**"
+            echo '```'
+            echo "${{ steps.apply.outputs.output }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
