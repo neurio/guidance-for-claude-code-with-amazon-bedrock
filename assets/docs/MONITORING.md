@@ -157,11 +157,15 @@ new dimension value and broad declarations multiply custom-metric cost.
 
 ## Usage Quota Monitoring
 
-Quota monitoring uses the CloudWatch Prometheus-compatible API (`monitoring.<region>.amazonaws.com/api/v1/query`) to query per-user token usage via PromQL. The quota monitor Lambda runs every 15 minutes, fetches usage data via PromQL, writes results to a DynamoDB table (`UserQuotaMetrics`), and checks against quota policies.
+Quota monitoring reads per-user usage from the TimescaleDB **telemetry database**, not from CloudWatch metrics. Cost is priced per model in the database from Bedrock invocation records, so there is a single cost formula. The quota monitor Lambda runs every 15 minutes, reads month-to-date and same-day cost and tokens per user, writes those totals to a DynamoDB table (`UserQuotaMetrics`) as absolute values, and checks against quota policies.
 
-The quota check Lambda provides real-time allow/block decisions by reading the DynamoDB table (fast reads, at most 15 minutes stale).
+Because the writes are absolute rather than accumulated, the monitor is idempotent: a retried or missed run cannot skew a counter.
 
-Both Claude Code and CoWork 3P (Claude Desktop) usage are counted toward the same per-user quota when the CoWork dashboard stack is deployed. See [CoWork 3P Quota Enforcement](COWORK_3P.md#quota-enforcement) for details.
+The quota check Lambda provides real-time allow/block decisions by reading the DynamoDB table (fast reads, at most 15 minutes stale — up to roughly 30 minutes counting the database rollup refresh).
+
+Both Claude Code and CoWork 3P (Claude Desktop) usage are counted toward the same per-user quota. Because the source is CloudTrail, which is client-agnostic, this does **not** require the CoWork dashboard stack. See [CoWork 3P Quota Enforcement](COWORK_3P.md#quota-enforcement) for details.
+
+> The PromQL dashboards described above are unaffected — they still run against OTLP-ingested metrics. Only quota accounting moved.
 
 > **Detailed Information**: See the [Quota Monitoring Guide](QUOTA_MONITORING.md).
 

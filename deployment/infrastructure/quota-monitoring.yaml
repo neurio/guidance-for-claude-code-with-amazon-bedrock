@@ -109,10 +109,167 @@ Parameters:
     Default: ''
     Description: OIDC client ID (audience) for JWT validation
 
+  # TimescaleDB telemetry database - authoritative per-user Bedrock cost source.
+  # String / CommaDelimitedList are used deliberately instead of the
+  # AWS::EC2::VPC::Id and List<AWS::EC2::Subnet::Id> types, because those
+  # AWS-specific types reject an empty default and would break stack updates for
+  # deployments that do not have a telemetry database.
+  TelemetryDbHost:
+    Type: String
+    Default: ''
+    Description: >-
+      Private IP or DNS name of the TimescaleDB instance holding per-user
+      Bedrock cost. Leave empty to disable the telemetry cost source (the quota
+      monitor then has no cost source and only checks existing DynamoDB totals).
+      Prefer a STABLE address - if the instance is in an Auto Scaling group its
+      primary private IP changes on replacement.
+
+  TelemetryDbPort:
+    Type: Number
+    Default: 5432
+    MinValue: 1
+    MaxValue: 65535
+    Description: TimescaleDB port
+
+  TelemetryDbName:
+    Type: String
+    Default: 'claude_telemetry'
+    Description: TimescaleDB database name
+
+  TelemetryDbSecretArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Full ARN of the Secrets Manager secret holding the TimescaleDB
+      credentials (JSON with at least `username` and `password`). Must be the
+      complete ARN including the random suffix. Setting this enables the
+      telemetry cost source and attaches the quota monitor to the VPC.
+
+  TelemetryDbSslMode:
+    Type: String
+    Default: 'disable'
+    AllowedValues:
+      - 'disable'
+      - 'require'
+      - 'verify-full'
+    Description: >-
+      TLS mode for the TimescaleDB connection. 'disable' = plaintext (required
+      if the server has ssl=off). 'require' = encrypted but the server
+      certificate is NOT verified (confidentiality only, not MITM-resistant).
+      'verify-full' = verified, and needs TelemetryDbCaPem.
+
+  TelemetryDbCaPem:
+    Type: String
+    Default: ''
+    Description: >-
+      Path to a CA bundle vendored in the Lambda package, used only when
+      TelemetryDbSslMode is 'verify-full' (e.g. /var/task/rds-ca.pem).
+
+  TelemetryDbVpcId:
+    Type: String
+    Default: ''
+    Description: VPC ID of the TimescaleDB instance - required when TelemetryDbSecretArn is set
+
+  TelemetryDbEgressCidr:
+    Type: String
+    Default: ''
+    Description: >-
+      CIDR the quota monitor is allowed to reach on TelemetryDbPort. Leave empty
+      to derive it as TelemetryDbHost/32, which only works when TelemetryDbHost
+      is an IP address - set this explicitly if TelemetryDbHost is a DNS name.
+
+  TelemetryDbSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Private subnet IDs (comma-separated) for the quota monitor's VPC
+      attachment. Must have a route to the database and NAT egress for the
+      DynamoDB/SNS/Secrets Manager API calls.
+
+  QuotaWriteMode:
+    Type: String
+    Default: 'shadow'
+    AllowedValues:
+      - 'shadow'
+      - 'enforce'
+    Description: >-
+      'shadow' = read the telemetry DB and log what would change, but leave
+      quota counters FROZEN (only `last_updated` is refreshed, so bypass
+      detection keeps working). 'enforce' = write absolute month-to-date
+      totals. Deploy in shadow first, compare, then switch to enforce.
+
+  QuotaDbMinRowRatio:
+    Type: Number
+    Default: 0.5
+    MinValue: 0
+    MaxValue: 1
+    Description: >-
+      Safety floor for absolute writes. If the telemetry DB returns fewer
+      identities than this fraction of the existing DynamoDB rows, the monitor
+      refuses to write and alerts instead of zeroing real usage.
+
+  # Slack DM notifier for spend-budget alerts. An empty secret ARN disables the
+  # feature outright (no role, no function, no subscription) — same "empty
+  # string disables" idiom as TelemetryDbSecretArn above.
+  SlackBotTokenSecretArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Full ARN of the Secrets Manager secret holding the Slack bot token,
+      including the random suffix. The secret may be either a bare token string
+      or a JSON object with the token under bot_token / token / slack_bot_token.
+      Required bot scopes: users:read, users:read.email, chat:write. Leave empty
+      to disable Slack DM notifications entirely.
+
+  # A Slack bot can only see and DM users in the workspace it is installed in.
+  # For a domain whose users live in a SEPARATE workspace, users.lookupByEmail
+  # returns users_not_found, which looks exactly like "no Slack account" — so
+  # those domains need their own app and token. Both params must be set for the
+  # routing to take effect; either one empty keeps single-workspace behaviour.
+  SlackSecondaryBotTokenSecretArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. Full ARN of the Secrets Manager secret holding a SECOND Slack
+      workspace's bot token, including the random suffix. Same accepted shapes
+      and same required scopes as SlackBotTokenSecretArn. Used only for the
+      domains listed in SlackSecondaryDomains. Leave empty for one workspace.
+
+  SlackSecondaryDomains:
+    Type: String
+    Default: ''
+    Description: >-
+      Comma-separated email domains routed to SlackSecondaryBotTokenSecretArn
+      (e.g. "ecobee.com"). Compared case-insensitively on the part after the @.
+      Any domain not listed uses the primary token, so adding a second workspace
+      cannot change delivery for the first.
+
+  SlackApiTimeoutSeconds:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+    Description: Per-request timeout for slack.com API calls
+
+  SlackDmHelpUrl:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional link included in the DM for requesting a budget increase
+      (runbook, ticket form). Leave empty to omit the line.
+
 Conditions:
   HasJwtAuth: !Not [!Equals [!Ref OidcIssuerUrl, '']]
   NoJwtAuth: !Equals [!Ref OidcIssuerUrl, '']
   BypassDetectionEnabled: !Equals [!Ref EnableBypassDetection, 'true']
+  HasTelemetryDb: !Not [!Equals [!Ref TelemetryDbSecretArn, '']]
+  HasTelemetryDbEgressCidr: !Not [!Equals [!Ref TelemetryDbEgressCidr, '']]
+  SlackNotifierEnabled: !Not [!Equals [!Ref SlackBotTokenSecretArn, '']]
+  # Both halves required: a token with no domains routed to it would never be
+  # used, and domains with no token silently fall back to the primary workspace.
+  SlackSecondaryWorkspaceEnabled: !And
+    - !Not [!Equals [!Ref SlackSecondaryBotTokenSecretArn, '']]
+    - !Not [!Equals [!Ref SlackSecondaryDomains, '']]
 
 Resources:
   # DynamoDB table for quota policies (user, group, default levels)
@@ -144,6 +301,13 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
+      # Opt-in per item: DynamoDB only deletes items that carry a numeric `ttl`
+      # (epoch SECONDS). Policies without the attribute -- default, group, and
+      # ordinary user policies -- are never touched. Only `quota set-user
+      # --expires-month-end` stamps it, for temporary single-month overrides.
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
       Tags:
         - Key: Name
           Value: QuotaPolicies
@@ -190,11 +354,6 @@ Resources:
   # IAM Role for Quota Monitor Lambda
   QuotaMonitorRole:
     Type: AWS::IAM::Role
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W11
-            reason: "CloudWatch GetMetricData/ListMetrics and CloudTrail LookupEvents require Resource: * by API design"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -203,8 +362,14 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      # AWSLambdaVPCAccessExecutionRole grants the ec2 Describe*/CreateNetworkInterface
+      # /DeleteNetworkInterface permissions Lambda needs to manage its ENI. It is only
+      # attached when the function is actually VPC-attached.
+      ManagedPolicyArns: !If
+        - HasTelemetryDb
+        - - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+          - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+        - - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
         - PolicyName: QuotaMonitorPolicy
           PolicyDocument:
@@ -231,11 +396,54 @@ Resources:
                 Action:
                   - sns:Publish
                 Resource: !Ref QuotaAlertTopic
+              # Read the TimescaleDB credentials. Scoped to the single secret
+              # ARN; an IAM Resource cannot be an empty string, so a harmless
+              # placeholder ARN is used when no telemetry DB is configured.
               - Effect: Allow
                 Action:
-                  - cloudwatch:GetMetricData
-                  - cloudwatch:ListMetrics
-                Resource: '*'
+                  - secretsmanager:GetSecretValue
+                Resource: !If
+                  - HasTelemetryDb
+                  - !Ref TelemetryDbSecretArn
+                  - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:claude-code-telemetry-db-unconfigured'
+
+  # Security group for the quota monitor's VPC attachment. Egress only - the
+  # function accepts no inbound traffic. Created only when a telemetry DB is
+  # configured.
+  QuotaMonitorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasTelemetryDb
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: >-
+              The telemetry VPC has no interface/gateway VPC endpoints, so the
+              DynamoDB, SNS and Secrets Manager API calls must reach public AWS
+              endpoints via NAT. Restricting egress to prefix lists would break
+              them.
+          - id: W40
+            reason: "Egress is restricted to explicit protocols/ports rather than IpProtocol: -1"
+    Properties:
+      GroupDescription: Egress-only security group for the Claude Code quota monitor Lambda
+      VpcId: !Ref TelemetryDbVpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: AWS API calls (DynamoDB, SNS, Secrets Manager) via NAT
+        - IpProtocol: tcp
+          FromPort: !Ref TelemetryDbPort
+          ToPort: !Ref TelemetryDbPort
+          CidrIp: !If
+            - HasTelemetryDbEgressCidr
+            - !Ref TelemetryDbEgressCidr
+            - !Sub '${TelemetryDbHost}/32'
+          Description: PostgreSQL/TimescaleDB
+      Tags:
+        - Key: Name
+          Value: claude-code-quota-monitor-sg
 
   # Lambda function for quota monitoring
   QuotaMonitorFunction:
@@ -244,7 +452,11 @@ Resources:
       cfn_nag:
         rules_to_suppress:
           - id: W89
-            reason: "Lambda invoked by EventBridge schedule, requires internet access for CloudWatch/DynamoDB/SNS — VPC adds complexity without security benefit"
+            reason: >-
+              VPC attachment is conditional (see the TelemetryDb* parameters).
+              When a telemetry database is configured the function runs in the
+              supplied private subnets; when it is not, the function only calls
+              public AWS API endpoints and exposes no inbound surface.
           - id: W92
             reason: "Event-driven single invocation every 15 min — reserved concurrency unnecessary"
     Properties:
@@ -253,8 +465,16 @@ Resources:
       Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt QuotaMonitorRole.Arn
-      Timeout: 60
-      MemorySize: 256
+      # Headroom for cold ENI attach + NAT'd Secrets Manager + the DB query plus
+      # a serial UpdateItem loop over every active identity.
+      Timeout: 180
+      MemorySize: 512
+      VpcConfig: !If
+        - HasTelemetryDb
+        - SecurityGroupIds:
+            - !GetAtt QuotaMonitorSecurityGroup.GroupId
+          SubnetIds: !Ref TelemetryDbSubnetIds
+        - !Ref 'AWS::NoValue'
       Environment:
         Variables:
           QUOTA_TABLE: !Ref UserQuotaMetrics
@@ -269,7 +489,14 @@ Resources:
           ENABLE_FINEGRAINED_QUOTAS: !Ref EnableFinegrainedQuotas
           MONTHLY_COST_LIMIT_USD: !Ref MonthlyCostLimitUsd
           DAILY_COST_LIMIT_USD: !Ref DailyCostLimitUsd
-          METRICS_REGION: !Ref 'AWS::Region'
+          TELEMETRY_DB_HOST: !Ref TelemetryDbHost
+          TELEMETRY_DB_PORT: !Ref TelemetryDbPort
+          TELEMETRY_DB_NAME: !Ref TelemetryDbName
+          TELEMETRY_DB_SECRET_ARN: !Ref TelemetryDbSecretArn
+          TELEMETRY_DB_SSL_MODE: !Ref TelemetryDbSslMode
+          TELEMETRY_DB_CA_PEM: !Ref TelemetryDbCaPem
+          QUOTA_WRITE_MODE: !Ref QuotaWriteMode
+          QUOTA_DB_MIN_ROW_RATIO: !Ref QuotaDbMinRowRatio
       Code: ./lambda-functions/quota_monitor/
 
   # EventBridge Rule to run quota monitor every 15 minutes
@@ -389,6 +616,119 @@ Resources:
 
   # ============================================
   # End Sidecar Bypass Detection
+  # ============================================
+
+  # ============================================
+  # Quota Cost-Alert Slack Notifier
+  # Subscribes to QuotaAlertTopic and DMs the affected user on Slack.
+  # The subscription FilterPolicy limits invocations to monthly_cost/daily_cost
+  # alerts, so token-quota alerts and operator alerts never reach this function
+  # and there is no in-code alert-type check to keep in sync.
+  # ============================================
+
+  QuotaSlackNotifierRole:
+    Type: AWS::IAM::Role
+    Condition: SlackNotifierEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: QuotaSlackNotifierPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The only non-logging AWS call this function makes. No
+              # placeholder-ARN !If is needed here (unlike QuotaMonitorRole
+              # above): the whole role is conditional on the ARN being
+              # non-empty, so Resource can never be an empty string. The second
+              # workspace's secret is added only when that feature is on, so a
+              # single-workspace deployment grants exactly one resource.
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !If
+                  - SlackSecondaryWorkspaceEnabled
+                  - - !Ref SlackBotTokenSecretArn
+                    - !Ref SlackSecondaryBotTokenSecretArn
+                  - !Ref SlackBotTokenSecretArn
+
+  QuotaSlackNotifierFunction:
+    Type: AWS::Lambda::Function
+    Condition: SlackNotifierEnabled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Must reach slack.com. Attaching this to the telemetry VPC would
+              require a NAT path to a public HTTPS endpoint and add a failure
+              mode; the function exposes no inbound surface.
+          - id: W92
+            reason: >-
+              Invoked only on spend-budget alerts, bounded by the quota_monitor
+              dedup table to one per user/threshold/period, so reserved
+              concurrency is unnecessary.
+    Properties:
+      FunctionName: claude-code-quota-slack-notifier
+      Description: DMs the affected user on Slack when a Bedrock spend budget threshold is crossed
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt QuotaSlackNotifierRole.Arn
+      # Two Slack calls, each with one bounded retry on a 429 Retry-After
+      # (capped at 20s in code), plus a cold Secrets Manager fetch.
+      Timeout: 60
+      MemorySize: 256
+      # Deliberately NOT VPC-attached — see the W89 suppression above.
+      Environment:
+        Variables:
+          SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
+          SLACK_API_TIMEOUT_SECONDS: !Ref SlackApiTimeoutSeconds
+          SLACK_DM_HELP_URL: !Ref SlackDmHelpUrl
+          # Passed unconditionally: the Lambda ignores them unless BOTH are
+          # non-empty, and gating them here would drop the pair out of sync.
+          SLACK_SECONDARY_BOT_TOKEN_SECRET_ARN: !Ref SlackSecondaryBotTokenSecretArn
+          SLACK_SECONDARY_DOMAINS: !Ref SlackSecondaryDomains
+      Code: ./lambda-functions/quota_slack_notifier/
+
+  QuotaSlackNotifierPermission:
+    Type: AWS::Lambda::Permission
+    Condition: SlackNotifierEnabled
+    Properties:
+      FunctionName: !Ref QuotaSlackNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref QuotaAlertTopic
+
+  QuotaSlackNotifierSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: SlackNotifierEnabled
+    # A genuine ordering dependency, not an implicit Ref/GetAtt one: neither
+    # resource references the other, but SNS accepts the subscription and then
+    # fails delivery until the invoke permission exists.
+    DependsOn: QuotaSlackNotifierPermission
+    Properties:
+      TopicArn: !Ref QuotaAlertTopic
+      Protocol: lambda
+      Endpoint: !GetAtt QuotaSlackNotifierFunction.Arn
+      # Filters on message attributes (the default scope). A message that does
+      # NOT carry an `alert_type` attribute is a NON-match, which is exactly how
+      # operator alerts (_publish_operational_alert) and sidecar bypass alerts
+      # are excluded — they publish no attributes at all. Token-quota alerts
+      # carry alert_type "monthly"/"daily" and so also do not match.
+      FilterPolicy:
+        alert_type:
+          - monthly_cost
+          - daily_cost
+
+  # ============================================
+  # End Quota Cost-Alert Slack Notifier
   # ============================================
 
   # ============================================
@@ -595,6 +935,13 @@ Outputs:
     Value: !GetAtt SidecarMonitorFunction.Arn
     Export:
       Name: !Sub '${AWS::StackName}-SidecarMonitorFunctionArn'
+
+  QuotaSlackNotifierFunctionArn:
+    Condition: SlackNotifierEnabled
+    Description: ARN of the Lambda that DMs users on Slack for spend-budget alerts
+    Value: !GetAtt QuotaSlackNotifierFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaSlackNotifierFunctionArn'
 
   QuotaApiInvokePolicyArn:
     Condition: NoJwtAuth

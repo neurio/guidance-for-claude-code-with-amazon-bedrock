@@ -1,31 +1,45 @@
-# ABOUTME: Tests that quota_monitor aggregates CoWork 3P usage alongside Claude Code
+# ABOUTME: Tests that CoWork 3P usage counts toward per-user quota via the telemetry DB
 # ABOUTME: Regression test for CoWork tokens not counting toward per-user quota
 
-"""Tests for CoWork 3P quota counting in quota_monitor Lambda."""
+"""Tests for CoWork 3P quota counting.
+
+quota_monitor used to run a second, CoWork-specific PromQL query against the
+`ClaudeCoWork` CloudWatch namespace and merge the result. That is gone: cost and
+tokens now come from `telemetry.unified_hourly_cost`, whose Bedrock branch is
+built from CloudTrail invocation records. CloudTrail records every Bedrock
+invocation with no notion of which client made it (`telemetry.bedrock_invocations`
+has no user-agent or client column), so CoWork Desktop traffic is counted by the
+same code path as the CLI — with no CoWork-specific query to maintain, and no
+dependency on the CoWork MetricFilter pipeline being deployed.
+
+Attribution still depends on the role session name carrying the user's email,
+which `credential-process` provides for CoWork exactly as it does for the CLI.
+"""
 
 from tests.cfn_yaml import INFRA_DIR, REPO_ROOT, load_resolved
 
 
 class TestCoWorkQuotaCounting:
-    """Verify quota_monitor queries ClaudeCoWork namespace and merges usage."""
+    """Verify CoWork usage reaches quota via the shared telemetry path."""
 
-    def test_quota_monitor_has_cowork_promql_query(self):
-        """The quota_monitor Lambda must query ClaudeCoWork namespace metrics."""
+    def test_quota_monitor_has_no_cowork_specific_query(self):
+        """CoWork needs no special-casing once cost comes from CloudTrail."""
         lambda_path = INFRA_DIR / "lambda-functions" / "quota_monitor" / "index.py"
         content = lambda_path.read_text(encoding="utf-8")
-        assert "ClaudeCoWork" in content, "quota_monitor must query ClaudeCoWork namespace"
-        assert "token.usage.input" in content, "quota_monitor must query CoWork input tokens"
-        assert "token.usage.output" in content, "quota_monitor must query CoWork output tokens"
-        assert "user_email" in content, "quota_monitor must group CoWork metrics by user_email"
+        assert "ClaudeCoWork" not in content, "the CoWork PromQL branch was removed; CoWork is counted via CloudTrail"
 
-    def test_cowork_query_is_non_fatal(self):
-        """CoWork PromQL failure must not crash quota monitoring."""
+    def test_quota_monitor_counts_all_bedrock_clients(self):
+        """The single cost source is the client-agnostic unified view."""
         lambda_path = INFRA_DIR / "lambda-functions" / "quota_monitor" / "index.py"
         content = lambda_path.read_text(encoding="utf-8")
-        # The CoWork query must be wrapped in try/except
-        assert "non-fatal" in content.lower() or "non_fatal" in content.lower() or "optional" in content.lower(), (
-            "CoWork PromQL query must be wrapped in try/except with non-fatal handling"
-        )
+        assert "telemetry.unified_hourly_cost" in content
+        assert "user_email" in content, "usage must be attributed per user_email"
+
+    def test_cowork_usage_is_not_gated_on_the_cowork_dashboard_stack(self):
+        """Quota counting must not require the optional cowork-dashboard stack."""
+        template = load_resolved(INFRA_DIR / "quota-monitoring.yaml")
+        rendered = str(template)
+        assert "ClaudeCoWork" not in rendered, "quota-monitoring must not depend on the CoWork metric namespace"
 
     def test_cowork_dashboard_has_user_email_dimension(self):
         """CoWork metric filters must include user_email dimension for per-user attribution."""

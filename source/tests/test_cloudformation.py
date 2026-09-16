@@ -3,6 +3,8 @@
 
 """Tests for CloudFormation template configuration."""
 
+import re
+
 from tests.cfn_yaml import INFRA_DIR, load_intrinsics
 
 
@@ -327,3 +329,180 @@ class TestBedrockAuthGenericTemplate:
                         partition_found = True
                         break
         assert partition_found, "Bedrock ARNs must use ${AWS::Partition} for GovCloud support"
+
+
+class TestFableDenyStatement:
+    """The Azure stack denies Claude Fable 5 outright; pin the exact ARN patterns.
+
+    These patterns are load-bearing and easy to break by "tidying": widening the
+    suffix to a trailing wildcard silently denies future Fable releases, and
+    narrowing the action list lets a new invoke action leak around the Deny.
+    """
+
+    DENIED_SUFFIX = "*anthropic.claude-fable-5"
+
+    def get_statement(self):
+        template = load_intrinsics(INFRA_DIR / "bedrock-auth-azure.yaml")
+        policy_doc = template["Resources"]["BedrockAccessPolicy"]["Properties"]["PolicyDocument"]
+        for stmt in policy_doc["Statement"]:
+            if isinstance(stmt, dict) and stmt.get("Sid") == "DenyClaudeFableModels":
+                return stmt
+        raise AssertionError("DenyClaudeFableModels statement missing from bedrock-auth-azure.yaml")
+
+    def test_denies_all_bedrock_actions(self):
+        """'bedrock:*' — not an action list — so a future invoke action cannot leak around it."""
+        stmt = self.get_statement()
+        assert stmt["Effect"] == "Deny"
+        assert stmt["Action"] == "bedrock:*"
+
+    def test_denies_exact_fable_5_suffix(self):
+        """Foundation-model and inference-profile ARNs, scoped to the exact model suffix."""
+        stmt = self.get_statement()
+        resources = [r["Fn::Sub"] for r in stmt["Resource"]]
+
+        assert resources == [
+            f"arn:${{AWS::Partition}}:bedrock:*::foundation-model/{self.DENIED_SUFFIX}",
+            f"arn:${{AWS::Partition}}:bedrock:::foundation-model/{self.DENIED_SUFFIX}",
+            f"arn:${{AWS::Partition}}:bedrock:*:*:inference-profile/{self.DENIED_SUFFIX}",
+        ]
+
+    def test_no_trailing_wildcard_after_model_name(self):
+        """A trailing '*' would re-widen the Deny beyond what the deployed policy does."""
+        stmt = self.get_statement()
+        for r in stmt["Resource"]:
+            assert r["Fn::Sub"].endswith(self.DENIED_SUFFIX), (
+                f"{r['Fn::Sub']!r} must end at the exact model suffix, not a wildcard"
+            )
+
+    def test_deny_precedes_allows(self):
+        """Order does not affect IAM evaluation, but keep the Deny first for readability."""
+        template = load_intrinsics(INFRA_DIR / "bedrock-auth-azure.yaml")
+        statements = template["Resources"]["BedrockAccessPolicy"]["Properties"]["PolicyDocument"]["Statement"]
+        assert statements[0].get("Sid") == "DenyClaudeFableModels"
+
+
+def _iam_wildcard_matches(pattern: str, value: str) -> bool:
+    """Match an IAM policy pattern against a value.
+
+    IAM resource/condition wildcards are only '*' (any sequence) and '?' (one
+    character) — every other character is literal, unlike fnmatch, which would
+    read '[' as a character class.
+    """
+    regex = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern)
+    return re.fullmatch(regex, value) is not None
+
+
+class TestFable51Allowlist:
+    """Fable 5.1 is allow-listed: denied for every aws:userid outside the list.
+
+    The list is the access-control decision itself, so pin its shape. The
+    failure modes are all silent — a bare email with no '*:' prefix can never
+    match a session's aws:userid (locks everyone out), and a trailing wildcard
+    on the Fable 5 Deny above would blanket-deny 5.1 regardless of the list.
+    """
+
+    ALLOWLISTED_SUFFIX = "*anthropic.claude-fable-5-1"
+
+    def get_statement(self, sid="DenyClaudeFable51ExceptAllowlist"):
+        template = load_intrinsics(INFRA_DIR / "bedrock-auth-azure.yaml")
+        policy_doc = template["Resources"]["BedrockAccessPolicy"]["Properties"]["PolicyDocument"]
+        for stmt in policy_doc["Statement"]:
+            if isinstance(stmt, dict) and stmt.get("Sid") == sid:
+                return stmt
+        raise AssertionError(f"{sid} statement missing from bedrock-auth-azure.yaml")
+
+    def test_denies_all_bedrock_actions_for_non_allowlisted(self):
+        """'bedrock:*' — not an action list — so a future invoke action cannot leak around it."""
+        stmt = self.get_statement()
+        assert stmt["Effect"] == "Deny"
+        assert stmt["Action"] == "bedrock:*"
+
+    def test_covers_foundation_model_and_inference_profile_arns(self):
+        """Regional, global (region-less), and inference-profile ARNs all carry the Deny."""
+        stmt = self.get_statement()
+        resources = [r["Fn::Sub"] for r in stmt["Resource"]]
+
+        assert resources == [
+            f"arn:${{AWS::Partition}}:bedrock:*::foundation-model/{self.ALLOWLISTED_SUFFIX}",
+            f"arn:${{AWS::Partition}}:bedrock:::foundation-model/{self.ALLOWLISTED_SUFFIX}",
+            f"arn:${{AWS::Partition}}:bedrock:*:*:inference-profile/{self.ALLOWLISTED_SUFFIX}",
+        ]
+
+    def test_conditions_on_aws_userid_string_not_like(self):
+        """StringNotLike + aws:userid is what turns a blanket Deny into an allowlist.
+
+        StringNotEquals would never match, because aws:userid is prefixed with the
+        role's unique ID; dropping the Condition entirely would deny everyone.
+        """
+        stmt = self.get_statement()
+        condition = stmt["Condition"]
+        assert list(condition) == ["StringNotLike"]
+        assert list(condition["StringNotLike"]) == ["aws:userid"]
+
+    def test_allowlist_is_non_empty(self):
+        """An empty list denies Fable 5.1 to everyone — safe, but never intentional here."""
+        allowed = self.get_statement()["Condition"]["StringNotLike"]["aws:userid"]
+        assert isinstance(allowed, list)
+        assert allowed, "allowlist is empty — Fable 5.1 would be denied to every user"
+
+    def test_every_entry_wildcards_the_role_unique_id(self):
+        """A bare email cannot match '<role-unique-id>:<session-name>' — it locks the user out."""
+        allowed = self.get_statement()["Condition"]["StringNotLike"]["aws:userid"]
+        for entry in allowed:
+            assert entry.startswith("*:"), (
+                f"{entry!r} must start with '*:' to match aws:userid's '<role-unique-id>:<session-name>' form"
+            )
+            assert "@" in entry, f"{entry!r} should be '*:<email>' — RoleSessionName is the raw email claim"
+
+    # Captured from a live session on the deployed role:
+    #   aws sts get-caller-identity --profile ClaudeCode --query UserId
+    # Azure AD spells the 'email' claim with capitals, which the first version of
+    # this allowlist got wrong — it listed a lowercased address, and because
+    # StringNotLike is case-sensitive the Deny fired for the very user it was
+    # written to exempt.
+    REAL_USERID = "AROAZD3IUWBAWNR5LWNXE:Cameron.Johnson@generac.com"
+
+    def test_real_session_userid_is_exempted(self):
+        """A known-good aws:userid must match an allowlist entry, casing included."""
+        allowed = self.get_statement()["Condition"]["StringNotLike"]["aws:userid"]
+        assert any(_iam_wildcard_matches(entry, self.REAL_USERID) for entry in allowed), (
+            f"{self.REAL_USERID} matches no entry in {allowed} — that user is denied Fable 5.1"
+        )
+
+    def test_entry_casing_is_load_bearing(self):
+        """Documents why entries are copied verbatim: a case-folded userid stops matching."""
+        allowed = self.get_statement()["Condition"]["StringNotLike"]["aws:userid"]
+        role_id, _, session_name = self.REAL_USERID.partition(":")
+        folded = f"{role_id}:{session_name.lower()}"
+        assert folded != self.REAL_USERID, "pick a REAL_USERID whose session name has capitals"
+        assert not any(_iam_wildcard_matches(entry, folded) for entry in allowed), (
+            "a lowercased session name still matches — the casing guard above proves nothing"
+        )
+
+    def test_allowlisted_userid_is_not_caught_by_the_fable_5_deny(self):
+        """The blanket Fable 5 Deny must not extend to 5.1, or the allowlist is dead.
+
+        Guards against re-widening 'claude-fable-5' to 'claude-fable-5*'.
+        """
+        fable_5_stmt = self.get_statement(sid="DenyClaudeFableModels")
+        fable_51_model_arn = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-fable-5-1"
+
+        for resource in fable_5_stmt["Resource"]:
+            pattern = resource["Fn::Sub"].replace("${AWS::Partition}", "aws")
+            assert not _iam_wildcard_matches(pattern, fable_51_model_arn), (
+                f"Fable 5 Deny pattern {pattern!r} also matches Fable 5.1 — allowlist can never grant access"
+            )
+
+    def test_deny_matches_cris_prefixed_inference_profiles(self):
+        """Users invoke us./global./eu. CRIS IDs, not the bare foundation-model ID."""
+        stmt = self.get_statement()
+        patterns = [r["Fn::Sub"].replace("${AWS::Partition}", "aws") for r in stmt["Resource"]]
+
+        for cris_arn in (
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-fable-5-1",
+            "arn:aws:bedrock:eu-west-1:123456789012:inference-profile/eu.anthropic.claude-fable-5-1",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/global.anthropic.claude-fable-5-1",
+        ):
+            assert any(_iam_wildcard_matches(p, cris_arn) for p in patterns), (
+                f"no Deny resource pattern matches {cris_arn}"
+            )
