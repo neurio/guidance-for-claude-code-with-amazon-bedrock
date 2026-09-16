@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       user_email:
-        description: "Generac email of the user to update"
+        description: "Generac email of the user to update (case-sensitive — must match the email casing from the user's ID token exactly)"
         required: true
         type: string
       monthly_limit:
