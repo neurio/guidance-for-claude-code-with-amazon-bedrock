@@ -327,3 +327,53 @@ class TestBedrockAuthGenericTemplate:
                         partition_found = True
                         break
         assert partition_found, "Bedrock ARNs must use ${AWS::Partition} for GovCloud support"
+
+
+class TestFableDenyStatement:
+    """The Azure stack denies Claude Fable 5 outright; pin the exact ARN patterns.
+
+    These patterns are load-bearing and easy to break by "tidying": widening the
+    suffix to a trailing wildcard silently denies future Fable releases, and
+    narrowing the action list lets a new invoke action leak around the Deny.
+    """
+
+    DENIED_SUFFIX = "*anthropic.claude-fable-5"
+
+    def get_statement(self):
+        template = load_intrinsics(INFRA_DIR / "bedrock-auth-azure.yaml")
+        policy_doc = template["Resources"]["BedrockAccessPolicy"]["Properties"]["PolicyDocument"]
+        for stmt in policy_doc["Statement"]:
+            if isinstance(stmt, dict) and stmt.get("Sid") == "DenyClaudeFableModels":
+                return stmt
+        raise AssertionError("DenyClaudeFableModels statement missing from bedrock-auth-azure.yaml")
+
+    def test_denies_all_bedrock_actions(self):
+        """'bedrock:*' — not an action list — so a future invoke action cannot leak around it."""
+        stmt = self.get_statement()
+        assert stmt["Effect"] == "Deny"
+        assert stmt["Action"] == "bedrock:*"
+
+    def test_denies_exact_fable_5_suffix(self):
+        """Foundation-model and inference-profile ARNs, scoped to the exact model suffix."""
+        stmt = self.get_statement()
+        resources = [r["Fn::Sub"] for r in stmt["Resource"]]
+
+        assert resources == [
+            f"arn:${{AWS::Partition}}:bedrock:*::foundation-model/{self.DENIED_SUFFIX}",
+            f"arn:${{AWS::Partition}}:bedrock:::foundation-model/{self.DENIED_SUFFIX}",
+            f"arn:${{AWS::Partition}}:bedrock:*:*:inference-profile/{self.DENIED_SUFFIX}",
+        ]
+
+    def test_no_trailing_wildcard_after_model_name(self):
+        """A trailing '*' would re-widen the Deny beyond what the deployed policy does."""
+        stmt = self.get_statement()
+        for r in stmt["Resource"]:
+            assert r["Fn::Sub"].endswith(self.DENIED_SUFFIX), (
+                f"{r['Fn::Sub']!r} must end at the exact model suffix, not a wildcard"
+            )
+
+    def test_deny_precedes_allows(self):
+        """Order does not affect IAM evaluation, but keep the Deny first for readability."""
+        template = load_intrinsics(INFRA_DIR / "bedrock-auth-azure.yaml")
+        statements = template["Resources"]["BedrockAccessPolicy"]["Properties"]["PolicyDocument"]["Statement"]
+        assert statements[0].get("Sid") == "DenyClaudeFableModels"

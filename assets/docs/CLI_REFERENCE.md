@@ -708,14 +708,64 @@ poetry run ccwb quota set-user <email> [options]
 **Options:**
 - `--monthly-limit, -m <tokens>` - Monthly token limit (supports K, M, B suffixes: 10M = 10,000,000)
 - `--daily-limit, -d <tokens>` - Daily token limit (optional)
+- `--budget, -b <usd>` - Monthly cost limit in USD (alias for `--monthly-cost-limit`)
+- `--daily-budget <usd>` - Daily cost limit in USD
 - `--enforcement, -e <mode>` - Enforcement mode: `alert` (monitor only) or `block` (deny access)
 - `--disabled` - Create policy in disabled state
+- `--expires-month-end` - Delete this policy after the current month (temporary override)
+- `--keep-alerts` - Keep this month's triggered alerts (default: clear them)
 - `--profile, -p <name>` - Configuration profile
 
 **Example:**
 ```bash
 poetry run ccwb quota set-user alice@example.com -m 5M -e block
 ```
+
+**Alert history is reset:**
+
+The quota monitor sends each threshold alert once per month per user, remembering
+what it already sent. Those records describe crossings of the *old* limits, so
+changing a user's policy clears this month's triggered alerts for that user —
+otherwise a user whose budget was raised could blow through the new budget with
+no alert and no Slack DM.
+
+```
+Updated existing user quota policy for bill@example.com
+  Monthly limit: 0
+  Monthly cost limit: $2500.00
+  Enforcement: alert (monthly), alert (daily)
+  Cleared 2 triggered alerts for this month (the new limits can alert again)
+```
+
+Notes:
+- Only that user's alerts, and only the current month's, are cleared. Group and
+  default policy changes never clear alert history.
+- Pass `--keep-alerts` to leave it alone (e.g. a cosmetic edit where you don't
+  want thresholds already announced to be announced again).
+- If the clear fails, the command reports it and exits non-zero even though the
+  policy was saved — a suppressed alert is otherwise invisible. Re-running the
+  command retries it.
+
+**Temporary overrides:**
+
+`--expires-month-end` stamps a DynamoDB TTL so a one-off budget raise does not
+carry into the next month:
+
+```bash
+# Raise Bill's budget to $2500 for this month only
+poetry run ccwb quota set-user bill@example.com --monthly-limit 0 --budget 2500 --expires-month-end
+```
+
+Notes:
+- The flag is authoritative on every run. Re-running **without** it clears the
+  expiry, making the policy permanent.
+- TTL deletion is best-effort and can lag up to ~48 hours past the month
+  boundary. The policy stays in force until the item is actually removed, so
+  don't use this where the exact cutover instant matters — run
+  `quota delete user <email>` instead.
+- Only user policies can expire. Group and default policies reject the flag,
+  since an expiring shared policy would silently drop enforcement for everyone
+  it covers.
 
 ### `quota set-group` - Set Group Quota
 
@@ -729,7 +779,7 @@ poetry run ccwb quota set-group <group> [options]
 - `<group>` - Group name (from OIDC groups claim)
 
 **Options:**
-- Same as `set-user`
+- Same as `set-user`, except `--expires-month-end` (user policies only)
 
 **Example:**
 ```bash
