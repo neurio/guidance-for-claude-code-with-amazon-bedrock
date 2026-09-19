@@ -15,6 +15,16 @@ from cleo.testers.application_tester import ApplicationTester
 from claude_code_with_bedrock.cli import create_application
 
 
+@pytest.fixture(autouse=True)
+def no_alert_clearing():
+    """Routing tests must not reach DynamoDB via set-user's alert-history reset.
+
+    The reset itself is covered in test_quota_clear_alerts.py.
+    """
+    with patch("claude_code_with_bedrock.cli.commands.quota._clear_sent_alerts", return_value=0):
+        yield
+
+
 class TestQuotaSetRouting:
     """Verify quota set routes to the correct subcommand."""
 

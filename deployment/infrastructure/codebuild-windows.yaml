@@ -123,7 +123,7 @@ Resources:
     Type: AWS::CodeBuild::Project
     Properties:
       Name: !Sub '${ProjectNamePrefix}-windows-build'
-      Description: Build Windows binaries for Claude Code with Nuitka
+      Description: !Sub 'Build Windows binaries for Claude Code with Nuitka - Updated ${AWS::StackName}'
       ServiceRole: !GetAtt CodeBuildServiceRole.Arn
       Artifacts:
         Type: S3

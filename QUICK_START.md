@@ -606,7 +606,7 @@ This deploys in order based on what you configured in Step 2:
 | Resource | What it does |
 |---|---|
 | DynamoDB table (`QuotaPolicies`) | Stores per-user/group/default token limits |
-| Lambda (quota-monitor) | Runs every 15 min — checks thresholds via PromQL, sends alerts |
+| Lambda (quota-monitor) | Runs every 15 min — reads per-user cost from the telemetry database, updates usage totals, sends alerts |
 | SNS topic | Delivers quota alerts to subscribed email/webhook |
 | API Gateway (quota check) | Real-time quota check at credential issuance time |
 

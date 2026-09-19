@@ -1436,6 +1436,114 @@ class InitCommand(Command):
                         # Central mode runs the collector server-side; users can't stop it.
                         config["quota"]["enable_bypass_detection"] = False
 
+                    # Telemetry database — the usage source for quota_monitor.
+                    # Cost is computed per model in the database (including the
+                    # cross-region inference surcharge), so there is one formula
+                    # rather than one per consumer.
+                    console.print("\n[bold]Telemetry Database (usage source)[/bold]")
+                    console.print("Quota usage is read from the TimescaleDB telemetry database,")
+                    console.print("which prices every Bedrock invocation recorded by CloudTrail.")
+                    console.print("[dim]This is required: without it, usage counters are never updated.[/dim]")
+
+                    tdb = config.get("quota", {})
+                    telemetry_db_secret_arn = questionary.text(
+                        "Secrets Manager ARN for the telemetry DB credentials:",
+                        default=tdb.get("telemetry_db_secret_arn", "") or "",
+                        validate=lambda x: (
+                            True
+                            if x.strip().startswith("arn:aws:secretsmanager:") or x.strip() == ""
+                            else "Enter a full secretsmanager ARN, or leave blank to skip"
+                        ),
+                    ).ask()
+                    config["quota"]["telemetry_db_secret_arn"] = (telemetry_db_secret_arn or "").strip()
+
+                    if config["quota"]["telemetry_db_secret_arn"]:
+                        console.print(
+                            "\n[dim]Give a stable host. The database instance may be "
+                            "autoscaling-managed, so its primary private IP can change; "
+                            "prefer a DNS name or a fixed secondary IP.[/dim]"
+                        )
+                        config["quota"]["telemetry_db_host"] = (
+                            questionary.text(
+                                "Database host (blank = use the host in the secret):",
+                                default=tdb.get("telemetry_db_host", "") or "",
+                            ).ask()
+                            or ""
+                        ).strip()
+                        config["quota"]["telemetry_db_port"] = int(
+                            questionary.text(
+                                "Database port:",
+                                default=str(tdb.get("telemetry_db_port", 5432)),
+                                validate=lambda x: x.isdigit() and 0 < int(x) < 65536,
+                            ).ask()
+                        )
+                        config["quota"]["telemetry_db_name"] = (
+                            questionary.text(
+                                "Database name:",
+                                default=tdb.get("telemetry_db_name", "claude_telemetry") or "claude_telemetry",
+                            ).ask()
+                            or "claude_telemetry"
+                        ).strip()
+
+                        console.print(
+                            "\n[dim]TLS mode. Choose 'disable' only if the server has SSL off "
+                            "(traffic is then plaintext within the VPC).[/dim]"
+                        )
+                        config["quota"]["telemetry_db_ssl_mode"] = questionary.select(
+                            "TLS mode for the database connection:",
+                            choices=["disable", "require", "verify-full"],
+                            default=tdb.get("telemetry_db_ssl_mode", "disable") or "disable",
+                        ).ask()
+
+                        console.print(
+                            "\n[dim]The quota monitor must run inside a VPC that can reach the "
+                            "database. Use private subnets with NAT egress — it also needs to "
+                            "reach DynamoDB, SNS and Secrets Manager.[/dim]"
+                        )
+                        config["quota"]["telemetry_db_vpc_id"] = (
+                            questionary.text(
+                                "VPC ID for the quota monitor Lambda:",
+                                default=tdb.get("telemetry_db_vpc_id", "") or "",
+                            ).ask()
+                            or ""
+                        ).strip()
+                        subnet_default = ",".join(tdb.get("telemetry_db_subnet_ids", []) or [])
+                        subnet_answer = (
+                            questionary.text(
+                                "Private subnet IDs (comma-separated):",
+                                default=subnet_default,
+                            ).ask()
+                            or ""
+                        )
+                        config["quota"]["telemetry_db_subnet_ids"] = [
+                            s.strip() for s in subnet_answer.split(",") if s.strip()
+                        ]
+                        config["quota"]["telemetry_db_egress_cidr"] = (
+                            questionary.text(
+                                "CIDR the Lambda may open DB connections to (e.g. 10.0.0.0/20):",
+                                default=tdb.get("telemetry_db_egress_cidr", "") or "",
+                            ).ask()
+                            or ""
+                        ).strip()
+
+                        console.print(
+                            "\n[bold]Cutover mode[/bold]\n"
+                            "[dim]'shadow' logs the per-user difference between the database and "
+                            "the current DynamoDB counters without changing them. 'enforce' "
+                            "overwrites the counters with the database totals. Start in shadow, "
+                            "compare a few cycles, then switch.[/dim]"
+                        )
+                        config["quota"]["write_mode"] = questionary.select(
+                            "Quota write mode:",
+                            choices=["shadow", "enforce"],
+                            default=tdb.get("write_mode", "shadow") or "shadow",
+                        ).ask()
+                    else:
+                        console.print(
+                            "[yellow]⚠ Skipped. Quota usage counters will not be updated "
+                            "until a telemetry database is configured.[/yellow]"
+                        )
+
                     console.print("\n[green]✓[/green] Quota monitoring configured:")
                     if limit_type == "cost":
                         console.print(
@@ -1452,6 +1560,12 @@ class InitCommand(Command):
                     console.print(f"  • Re-check interval: {check_interval} minutes")
                     if config["quota"].get("enable_bypass_detection"):
                         console.print("  • Sidecar bypass detection: enabled")
+                    if config["quota"].get("telemetry_db_secret_arn"):
+                        console.print(
+                            f"  • Usage source: telemetry database ({config['quota'].get('write_mode', 'shadow')} mode)"
+                        )
+                    else:
+                        console.print("  • Usage source: [yellow]not configured[/yellow]")
 
             # Save monitoring progress
             progress.save_step("monitoring_complete", config)
@@ -3018,6 +3132,17 @@ class InitCommand(Command):
             "monthly_enforcement_mode": config_data.get("quota", {}).get("monthly_enforcement_mode", "block"),
             "quota_check_interval": config_data.get("quota", {}).get("check_interval", 30),
             "enable_bypass_detection": config_data.get("quota", {}).get("enable_bypass_detection", False),
+            "telemetry_db_secret_arn": config_data.get("quota", {}).get("telemetry_db_secret_arn"),
+            "telemetry_db_host": config_data.get("quota", {}).get("telemetry_db_host"),
+            "telemetry_db_port": config_data.get("quota", {}).get("telemetry_db_port", 5432),
+            "telemetry_db_name": config_data.get("quota", {}).get("telemetry_db_name", "claude_telemetry"),
+            "telemetry_db_ssl_mode": config_data.get("quota", {}).get("telemetry_db_ssl_mode", "disable"),
+            "telemetry_db_ca_pem": config_data.get("quota", {}).get("telemetry_db_ca_pem"),
+            "telemetry_db_vpc_id": config_data.get("quota", {}).get("telemetry_db_vpc_id"),
+            "telemetry_db_subnet_ids": config_data.get("quota", {}).get("telemetry_db_subnet_ids", []),
+            "telemetry_db_egress_cidr": config_data.get("quota", {}).get("telemetry_db_egress_cidr"),
+            "quota_write_mode": config_data.get("quota", {}).get("write_mode", "shadow"),
+            "quota_db_min_row_ratio": config_data.get("quota", {}).get("db_min_row_ratio", 0.5),
             "cowork_3p_enabled": config_data.get("cowork_3p", {}).get("enabled", True),
             "cowork_3p_extra_keys": config_data.get("cowork_3p", {}).get("extra_keys", {}),
             "cowork_service_token": config_data.get("cowork_3p", {}).get("service_token", ""),
@@ -3454,6 +3579,17 @@ class InitCommand(Command):
                     "daily_cost_limit": getattr(profile, "daily_cost_limit_usd", 0),
                     "check_interval": getattr(profile, "quota_check_interval", 30),
                     "enable_bypass_detection": getattr(profile, "enable_bypass_detection", False),
+                    "telemetry_db_secret_arn": getattr(profile, "telemetry_db_secret_arn", None),
+                    "telemetry_db_host": getattr(profile, "telemetry_db_host", None),
+                    "telemetry_db_port": getattr(profile, "telemetry_db_port", 5432),
+                    "telemetry_db_name": getattr(profile, "telemetry_db_name", "claude_telemetry"),
+                    "telemetry_db_ssl_mode": getattr(profile, "telemetry_db_ssl_mode", "disable"),
+                    "telemetry_db_ca_pem": getattr(profile, "telemetry_db_ca_pem", None),
+                    "telemetry_db_vpc_id": getattr(profile, "telemetry_db_vpc_id", None),
+                    "telemetry_db_subnet_ids": getattr(profile, "telemetry_db_subnet_ids", []),
+                    "telemetry_db_egress_cidr": getattr(profile, "telemetry_db_egress_cidr", None),
+                    "write_mode": getattr(profile, "quota_write_mode", "shadow"),
+                    "db_min_row_ratio": getattr(profile, "quota_db_min_row_ratio", 0.5),
                 }
 
             # Add analytics configuration if present
