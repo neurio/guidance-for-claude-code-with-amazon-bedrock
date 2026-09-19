@@ -145,6 +145,11 @@ Resources:
               StringNotLike:
                 'aws:userid':
                   - '*:Cameron.Johnson@generac.com'
+                  - '*:Kunal.Mehta@generac.com'
+                  - '*:Max.Galyliak@generac.com'
+                  - '*:Matthew.Kowalski@generac.com'
+                  - '*:Christopher.Harper@generac.com'
+                  - '*:Rick.Mellor@generac.com'
           - Sid: AllowBedrockInvokeRegional
             Effect: Allow
             Action:
