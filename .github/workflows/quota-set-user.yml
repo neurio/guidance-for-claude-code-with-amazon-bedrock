@@ -7,11 +7,6 @@ on:
         description: "Generac email of the user to update (case-sensitive — must match the email casing from the user's ID token exactly)"
         required: true
         type: string
-      monthly_limit:
-        description: "Monthly token limit (0 disables token-count enforcement)"
-        required: true
-        type: string
-        default: "0"
       budget:
         description: "Month-to-date cost budget in USD"
         required: true
@@ -87,7 +82,7 @@ jobs:
             EXPIRES_FLAG="--expires-month-end"
           fi
           OUTPUT=$(poetry run ccwb quota set-user "${{ inputs.user_email }}" \
-            --monthly-limit "${{ inputs.monthly_limit }}" \
+            --monthly-limit "0" \
             --budget "${{ inputs.budget }}" \
             $EXPIRES_FLAG \
             --profile et-ai-dev-us-east-1 \
@@ -106,7 +101,7 @@ jobs:
             echo "### Quota update"
             echo "- **Requested by:** \`${{ github.actor }}\`"
             echo "- **Target user:** \`${{ inputs.user_email }}\`"
-            echo "- **Monthly limit:** \`${{ inputs.monthly_limit }}\`"
+            echo "- **Monthly limit:** \`0 (fixed — cost-based quotas only)\`"
             echo "- **Budget:** \`${{ inputs.budget }}\`"
             echo "- **Enforcement:** \`${{ inputs.enforcement }}\`"
             echo "- **Expires month end:** \`${{ inputs.expires_month_end }}\`"
