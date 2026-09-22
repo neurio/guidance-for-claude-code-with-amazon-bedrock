@@ -81,6 +81,7 @@ jobs:
           if [ "${{ inputs.expires_month_end }}" = "true" ]; then
             EXPIRES_FLAG="--expires-month-end"
           fi
+          set +e
           OUTPUT=$(poetry run ccwb quota set-user "${{ inputs.user_email }}" \
             --monthly-limit "0" \
             --budget "${{ inputs.budget }}" \
@@ -88,6 +89,7 @@ jobs:
             --profile et-ai-dev-us-east-1 \
             --enforcement "${{ inputs.enforcement }}" 2>&1)
           EXIT_CODE=$?
+          set -e
           echo "$OUTPUT"
           echo "output<<EOF" >> "$GITHUB_OUTPUT"
           echo "$OUTPUT" >> "$GITHUB_OUTPUT"
